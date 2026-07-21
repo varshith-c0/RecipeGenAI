@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Recipe Processor</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="h-screen w-screen bg-gray-100 p-4">
+  <div class="flex h-[100%] space-x-4">
+    <!-- Left Pane -->
+    <div class="flex flex-col w-1/2 space-y-4">
+
+      <!-- Recipe Text Input -->
+      <textarea id="recipeText" placeholder="Recipe Text"
+        class="flex-1 p-3 rounded-lg border border-gray-300 resize-none focus:outline-none focus:ring-2 focus:ring-purple-400 disabled:bg-gray-200 disabled:cursor-not-allowed"></textarea>
+
+      <!-- Process Text Button with Checkboxes -->
+      <div class="flex justify-center items-center gap-7">
+        <button id="processTextBtn" onclick="processFromText()"
+          class="bg-purple-600 text-white px-6 py-3 rounded-xl text-lg hover:bg-purple-700 shadow-lg transition disabled:bg-gray-400 disabled:cursor-not-allowed">
+          Process Text Recipe
+        </button>
+
+        <!-- Checkboxes -->
+        <div class="flex items-center gap-4">
+          <label class="flex items-center gap-2 text-gray-700">
+            <input type="checkbox" id="ingCheck" class="w-6 h-6 text-purple-600 border-gray-300 rounded focus:ring-purple-500" checked>
+            Ingredient Check
+          </label>
+
+          <label class="flex items-center gap-2 text-gray-700">
+            <input type="checkbox" id="instrCheck" class="w-6 h-6 text-purple-600 border-gray-300 rounded focus:ring-purple-500" checked>
+            Instruction Check
+          </label>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-2">
+  <!-- YouTube Link Input -->
+  <input type="text" id="ytVideoLink" placeholder="YT video link"
+    class="flex-1 text-lg rounded-lg border border-gray-300 px-4 py-3 focus:outline-none focus:ring-2 focus:ring-red-400 disabled:bg-gray-200 disabled:cursor-not-allowed" />
+
+  <!-- Process Video Button -->
+  <button id="processVideoBtn" onclick="processFromURL()"
+    class="bg-red-600 text-white px-6 py-3 rounded-xl text-lg hover:bg-red-700 shadow-lg transition disabled:bg-gray-400 disabled:cursor-not-allowed">
+    Process URL
+  </button>
+</div>
+
+    </div>
+
+    <!-- Right Pane (Output) -->
+    <div class="flex flex-col w-1/2 space-y-4">
+      <textarea id="output" placeholder="Processed Output"
+        class="flex-1 p-3 rounded-lg border border-gray-300 resize-none bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400"
+        readonly></textarea>
+    </div>
+  </div>
+
+  <script>
+    async function processFromText() {
+      await handleProcessing({
+        recipeText: document.getElementById('recipeText').value,
+        ytVideoLink: '',
+        ingredientCheck: document.getElementById('ingCheck').checked,
+        instructionCheck: document.getElementById('instrCheck').checked,
+      }, 'processTextBtn');
+    }
+
+    async function processFromURL() {
+      await handleProcessing({
+        recipeText: '',
+        ytVideoLink: document.getElementById('ytVideoLink').value,
+        ingredientCheck: document.getElementById('ingCheck').checked,
+        instructionCheck: document.getElementById('instrCheck').checked,
+      }, 'processVideoBtn');
+    }
+
+    async function handleProcessing(data, buttonId) {
+      const outputArea = document.getElementById('output');
+      const processBtn = document.getElementById(buttonId);
+
+      processBtn.disabled = true;
+      outputArea.classList.remove('ring-2', 'ring-green-400', 'ring-red-400');
+      outputArea.value = "Processing...";
+
+      try {
+        const response = await fetch('/process_recipe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data)
+        });
+
+        const result = await response.json();
+        outputArea.value = result.output;
+
+        if (result.yt_recipe !== null && result.yt_recipe !== undefined) {
+          document.getElementById('recipeText').value = result.yt_recipe;
+        }
+
+        if (result.status) {
+          outputArea.classList.add('ring-2', 'ring-green-400');
+        } else {
+          outputArea.classList.add('ring-2', 'ring-red-400');
+          alert(result.output);
+        }
+      } catch (error) {
+        outputArea.value = "Error: Could not connect to server.";
+        outputArea.classList.add('ring-2', 'ring-red-400');
+        alert("Could not connect to server.");
+      } finally {
+        processBtn.disabled = false;
+      }
+    }
+
+    window.onload = toggleInputs;
+  </script>
+</body>
+
+</html>

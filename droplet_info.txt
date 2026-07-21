@@ -1,0 +1,4 @@
+SSH Access - root@64.225.84.189
+Password: chatbot1@Nosh
+
+http://64.225.84.189:8100

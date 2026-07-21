@@ -1,0 +1,232 @@
+TEST RECIPE SUITE — Nosh orchestrator manual/regression testing
+=================================================================
+Each block below is a standalone `recipeText` payload — paste one block's
+recipe text (everything between the ===TEST N=== marker and the next one,
+excluding the "TESTS:" comment lines) into the /process_recipe request body,
+or pass it directly to generate_recipe().
+
+For each test, check the generated commands against the "TESTS:" checklist
+before that recipe. Keep this file updated as new bug classes are found —
+it's the seed for the golden regression suite.
+
+
+===TEST 1: Ghee / Fractional Spice / Pre-cooked Dal / Water>250ml===
+TESTS:
+- Ghee must NOT be dispensed via "oil dispense" (solid fat exclusion rule).
+- Turmeric 1/3 tsp -> dispense count must be a whole number (round(0.333*4)=1),
+  never "spice turmeric dispense 1.33 times".
+- Toor dal is stated as pressure-cooked/pre-cooked -> should become a
+  preparation_step, not run through raw-ingredient fallback timing.
+- Water 400 ml (>250) -> must have "stove heat 8" before, dispense, then
+  "stir mix_liquid 1 times", then the temperature-timeout/heat_till sequence,
+  then restore prior stove heat.
+
+**Dal Tadka**
+**Ingredients:**
+* Toor dal (pressure-cooked) - 200 grams
+* Ghee - 2 tbsp
+* Mustard seeds - 1/2 tsp
+* Cumin seeds - 1/2 tsp
+* Turmeric powder - 1/3 tsp
+* Red chili powder - 3/4 tsp
+* Salt - to taste
+* Water - 400 ml
+**Instructions:**
+1. Heat ghee in the pot.
+2. Add mustard seeds and cumin seeds, let them splutter.
+3. Add turmeric powder and red chili powder, stir well.
+4. Add the pressure-cooked toor dal and mix.
+5. Add salt to taste.
+6. Add 400 ml of water and stir.
+7. Cook for 5 minutes on low flame.
+8. Turn off the stove and serve hot.
+
+
+===TEST 2: AI-Assisted Cooking Override Trigger===
+TESTS:
+- Onion is AI-cook eligible, but a spice (turmeric/chili) is dispensed BEFORE
+  the onion's "cook onion till cooked" command -> validator must flag onion
+  and force a manual stir/wait replacement instead of the AI command.
+- Onion (50g) shares a cooking stage with paneer (300g) -> onion's weight
+  share of that stage is well under 80% -> second, independent trigger for
+  the same manual-override rule.
+
+**Onion Paneer Curry**
+**Ingredients:**
+* Onion - 50 grams, finely chopped
+* Paneer - 300 grams, cubed
+* Turmeric powder - 1/4 tsp
+* Red chili powder - 1/2 tsp
+* Salt - 1/2 tsp
+* Oil - 30 ml
+**Instructions:**
+1. Heat oil in the pot.
+2. Add turmeric powder and red chili powder.
+3. Add onion and paneer together and cook until the onion turns soft and translucent.
+4. Add salt and mix well.
+5. Cook for 3 minutes on medium flame.
+6. Turn off the stove and serve.
+
+
+===TEST 3: Fallback Table Hit (verified sequence must override vague text)===
+TESTS:
+- "cook until soft and tender" / "a few more minutes" for cauliflower are
+  vague — get_fallback_timing has a VERIFIED 'cauliflower' entry (with its
+  own water additions and a mid-cook heat change) that must be translated
+  verbatim into commands, not re-estimated from RAG or free-form guessing.
+
+**Simple Cauliflower Sabzi**
+**Ingredients:**
+* Cauliflower - 400 grams, cut into florets
+* Cumin seeds - 1/2 tsp
+* Turmeric powder - 1/4 tsp
+* Salt - 1/2 tsp
+* Oil - 20 ml
+**Instructions:**
+1. Heat oil and add cumin seeds, let them splutter.
+2. Add cauliflower florets and turmeric powder, mix well.
+3. Cook the cauliflower until soft and tender.
+4. Add salt and mix.
+5. Cook for a few more minutes on low flame.
+6. Turn off the stove and serve.
+
+
+===TEST 4: No Fallback Entry + Weak/No RAG Match (known open gap — canary)===
+TESTS:
+- Drumstick (moringa) has no fallback_instr.py entry and is unlikely to have
+  a close RAG match. Recipe gives NO explicit cook duration anywhere.
+  This is the hardest case we've deferred fixing — use this test to observe
+  what the model currently does (sanity-check the guess, don't expect
+  precision) rather than to assert a specific pass/fail.
+
+**Drumstick Moringa Curry**
+**Ingredients:**
+* Drumstick (moringa) - 250 grams, cut into pieces
+* Tamarind pulp - 30 grams
+* Sambar powder - 1 tsp
+* Salt - 1/2 tsp
+* Water - 300 ml
+* Oil - 15 ml
+**Instructions:**
+1. Heat oil, add sambar powder and stir briefly.
+2. Add drumstick pieces and mix.
+3. Add tamarind pulp and salt.
+4. Add water.
+5. Cook the drumstick until it turns tender and cooked through.
+6. Turn off the stove and serve.
+
+
+===TEST 5: Serving Size Anchor Inference (no serving count stated)===
+TESTS:
+- No "serves N" anywhere in the text. Paneer is 300g -> anchor table says
+  ~75g/serving -> estimate_serving_size should yield serving = 4.
+
+**Matar Paneer**
+**Ingredients:**
+* Paneer - 300 grams, cubed
+* Green peas - 150 grams
+* Tomato - 200 grams, chopped
+* Onion - 100 grams, chopped
+* Ginger garlic paste - 1 tbsp
+* Turmeric powder - 1/2 tsp
+* Red chili powder - 1 tsp
+* Garam masala - 1/2 tsp
+* Salt - 1 tsp
+* Oil - 30 ml
+* Water - 200 ml
+**Instructions:**
+1. Heat oil, add onion and cook until golden.
+2. Add ginger garlic paste and cook for 1 minute.
+3. Add tomato and cook until soft, about 4 minutes.
+4. Add turmeric, chili powder, and salt. Mix well.
+5. Add paneer and green peas.
+6. Add water and simmer for 8 minutes.
+7. Add garam masala and mix.
+8. Turn off the stove and serve.
+
+
+===TEST 6: Explicit Total Time Header vs Vague Per-Step Wording===
+TESTS:
+- "Total Cooking Time: 45 minutes" is explicitly stated. Every individual
+  step is deliberately vague ("for a bit", "for a while", "for some time").
+  Final output's total active cook/wait time should land close to 45
+  minutes because it was explicitly given — it must NOT get silently
+  overridden by a RAG-calibrated figure just because the per-step wording
+  is vague. (This is the exact contradiction found during the Matar Paneer
+  10-min-vs-64-min test earlier — keep this as the standing regression case.)
+
+**Chana Masala**
+Total Cooking Time: 45 minutes
+**Ingredients:**
+* Chickpeas (pre-boiled/pressure-cooked) - 300 grams
+* Onion - 100 grams, chopped
+* Tomato - 150 grams, chopped
+* Ginger garlic paste - 1 tbsp
+* Chana masala powder - 1 tsp
+* Turmeric powder - 1/2 tsp
+* Red chili powder - 1 tsp
+* Salt - 1 tsp
+* Oil - 25 ml
+* Water - 200 ml
+**Instructions:**
+1. Heat oil, add onion and cook for a bit until soft.
+2. Add ginger garlic paste and cook briefly.
+3. Add tomato and cook for a while until mushy.
+4. Add turmeric, chili powder, chana masala, and salt.
+5. Add the pre-boiled chickpeas and water.
+6. Simmer for some time until everything comes together.
+7. Turn off the stove and serve.
+
+
+===TEST 7: Water Dispense Threshold Boundary (250ml vs 260ml)===
+TESTS:
+- Step 4 dispenses exactly 250 ml -> rule is ">250", so this must NOT get
+  the "stove heat 8" + "stir mix_liquid 1 times" sequence.
+- Step 6 dispenses 260 ml -> this MUST get the full heat-8/stir/heat_till
+  sequence, then restore the stove heat that was active before it.
+
+**Toor Dal Rasam**
+**Ingredients:**
+* Toor dal (pre-boiled) - 100 grams
+* Tomato - 100 grams, chopped
+* Rasam powder - 1 tsp
+* Mustard seeds - 1/4 tsp
+* Curry leaves - 6
+* Salt - 1/2 tsp
+* Oil - 10 ml
+**Instructions:**
+1. Heat oil, add mustard seeds and curry leaves, let them splutter.
+2. Add tomato and cook until soft.
+3. Add the pre-boiled toor dal and rasam powder.
+4. Add 250 ml of water and stir.
+5. Cook for 4 minutes on medium flame.
+6. Add another 260 ml of water and mix.
+7. Simmer for 5 minutes on low flame.
+8. Add salt, turn off the stove, and serve.
+
+
+===TEST 8: Header Metadata Inference + Suji AI-Cook Command===
+TESTS:
+- course should infer as Breakfast, cuisine as South Indian, dish_type as
+  Vegetarian in the output header block.
+- Suji (semolina) is one of the AI-assisted ingredients -> should produce
+  "cook suji till cooked" (unless the validator finds a reason to override,
+  same as Test 2's rule).
+
+**Rava Idli**
+**Ingredients:**
+* Semolina (rava/suji) - 200 grams
+* Yogurt - 100 grams
+* Water - 50 ml
+* Mustard seeds - 1/4 tsp
+* Curry leaves - 5
+* Salt - 1/2 tsp
+* Eno fruit salt - 1/2 tsp
+* Oil - 10 ml
+**Instructions:**
+1. Mix semolina, yogurt, and water into a batter and let it rest for 15 minutes.
+2. Heat oil, add mustard seeds and curry leaves.
+3. Add this tempering to the batter along with salt and eno.
+4. Pour batter into idli molds.
+5. Cook suji till cooked.
+6. Turn off the stove and serve hot.

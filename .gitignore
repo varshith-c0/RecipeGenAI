@@ -1,0 +1,22 @@
+.env
+recipe_box/
+eval_dataset/
+benchmarking/
+*.log
+app.log.1
+app.log.2
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+# PyBuilder
+.pybuilder/
+target/
+# Jupyter Notebook
+.ipynb_checkpoints
+__pypackages__/
+cython_debug/
+
+**/*.bin
+*.db
