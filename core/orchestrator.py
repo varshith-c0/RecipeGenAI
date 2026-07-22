@@ -19,7 +19,8 @@ from google.genai import types
 from google.genai.errors import ServerError, APIError
 from pydantic import BaseModel, Field, ValidationError
 
-from core.rag_tool import get_rag_reference, pick_cook_time_for_serving
+from core.rag_tool import (get_rag_reference, pick_cook_time_for_serving,
+                           pick_value_for_serving)
 from core.tools import (_convert_quantity_to_grams, _estimate_serving_size,
                         _get_fallback_instructions, _ANCHOR_SERVING_GRAMS)
 from core.ai_cmd_validator import ai_cmds_validator
@@ -221,8 +222,13 @@ _MAX_REPAIR_ROUNDS = 3
 
 _WAIT_RE = re.compile(r"^wait\s+(\d+)\s+seconds", re.IGNORECASE)
 _COOK_RE = re.compile(r"^cook\s+(\d+)\s+seconds", re.IGNORECASE)
-_COOK_AI_RE = re.compile(r"^cook\s+\S+\s+till\s+cooked", re.IGNORECASE)
-_COOK_AI_ING_RE = re.compile(r"^cook\s+(\S+)\s+till\s+cooked", re.IGNORECASE)
+# Any `cook X till <state>` is an AI-assisted (vision-model) step, not just
+# `till cooked` — `cook onion till golden_brown` watches the pan exactly the same way.
+# Restricting this to the literal word "cooked" made the orchestrator disagree with
+# ai_cmd_validator's own _AI_COOK_RE (`^cook (.+?) till\b`), so a browning step was
+# invisible here: it skipped the AI-eligibility and cook-before-dispense checks
+# entirely, and counted as ZERO seconds of cook time. Group 1 is the ingredient.
+_COOK_AI_RE = re.compile(r"^cook\s+(.+?)\s+till\b", re.IGNORECASE)
 _TRAY_DISPENSE_RE = re.compile(r"^ingredient_tray\s+(\d+)\s+dispense", re.IGNORECASE)
 # add_rice_specific_cmds keys off this exact command to override the water amount.
 _COOK_RICE_RE = re.compile(r"^cook\s+rice\s+till\s+cooked\s*$", re.IGNORECASE)
@@ -238,14 +244,37 @@ _EXPLICIT_TIME_RE = re.compile(r"total\s*(?:cooking|active)?\s*time\s*[:\-]?\s*\
 _COOK_TIME_TOLERANCE_RATIO = 0.18  # ~15-20% band
 
 
+# An AI-assisted step has no written duration — it runs until the vision model says
+# the ingredient looks done — so it used to contribute nothing at all, and its mere
+# presence switched off under-time detection entirely. That blank cheque is what let a
+# 17.5-minute cabbage-and-potato script pass against a 30-minute target. Crediting each
+# step a realistic duration keeps the check alive instead.
+#
+# The credit keys off the INGREDIENT, not the written state. Every AI step reaches us
+# as "till cooked" — cmd_processor is what later rewrites onion to "till golden_brown"
+# — so trusting the state word here would credit a 4-minute browning step the same 10
+# minutes as rice cooking through. That single misestimate is enough to pull a badly
+# under-timed dish back inside tolerance and hide the very bug this check exists for.
+_AI_BROWNING_INGS = ("onion", "tomato")  # cmd_processor turns these into browning steps
+_AI_BROWNING_SECONDS = 240
+_AI_COOKED_SECONDS = 600
+
+
 def _compute_total_active_minutes(commands: list) -> tuple:
-    """Returns (total_active_minutes, has_ai_assisted_step) parsed from generated commands."""
+    """Returns (written_active_minutes, ai_credit_minutes) parsed from generated commands.
+
+    Kept separate so callers can tell measured time from estimated time — the written
+    total is exact, the AI credit is an estimate and shouldn't be reported as fact.
+    """
     total_s = 0.0
-    has_ai_assisted = False
+    ai_credit_s = 0.0
     for cmd in commands or []:
         c = cmd.strip()
-        if _COOK_AI_RE.match(c):
-            has_ai_assisted = True
+        m = _COOK_AI_RE.match(c)
+        if m:
+            ing = m.group(1).strip().lower()
+            ai_credit_s += (_AI_BROWNING_SECONDS if ing in _AI_BROWNING_INGS
+                            else _AI_COOKED_SECONDS)
             continue
         m = _WAIT_RE.match(c) or _COOK_RE.match(c) or _TIMEOUT_RE.match(c)
         if m:
@@ -255,7 +284,7 @@ def _compute_total_active_minutes(commands: list) -> tuple:
         if m:
             stir_type, count = m.group(1).lower(), int(m.group(2))
             total_s += count * _STIR_SECONDS.get(stir_type, _DEFAULT_STIR_SECONDS)
-    return total_s / 60.0, has_ai_assisted
+    return total_s / 60.0, ai_credit_s / 60.0
 
 
 def _has_explicit_total_time(recipe_text: str) -> bool:
@@ -263,16 +292,10 @@ def _has_explicit_total_time(recipe_text: str) -> bool:
     return bool(_EXPLICIT_TIME_RE.search(recipe_text))
 
 
-def _time_out_of_tolerance(generated_s: float, target_s: float, has_ai_assisted: bool) -> bool:
-    """
-    True if generated active time deviates from the RAG target by more than
-    ~18%. When an AI-assisted ('cook X till cooked') step is present, its real
-    duration isn't counted in generated_s at all, so generated time below
-    target is expected and NOT flagged — only an excess above target still is.
-    """
-    if has_ai_assisted and generated_s <= target_s:
-        return False
-    return abs(generated_s - target_s) / target_s > _COOK_TIME_TOLERANCE_RATIO
+def _time_out_of_tolerance(effective_s: float, target_s: float) -> bool:
+    """True if effective cook time (written + credited AI time) deviates from the RAG
+    target by more than ~18%."""
+    return abs(effective_s - target_s) / target_s > _COOK_TIME_TOLERANCE_RATIO
 
 
 def _check_cook_time(output, rag_ref: dict, recipe_text: str) -> Optional[str]:
@@ -280,13 +303,23 @@ def _check_cook_time(output, rag_ref: dict, recipe_text: str) -> Optional[str]:
     if not target_min or _has_explicit_total_time(recipe_text):
         return None
     target_s = target_min * 60
-    generated_min, has_ai_assisted = _compute_total_active_minutes(output.commands)
-    generated_s = generated_min * 60
-    if not _time_out_of_tolerance(generated_s, target_s, has_ai_assisted):
+    written_min, ai_credit_min = _compute_total_active_minutes(output.commands)
+    written_s, ai_credit_s = written_min * 60, ai_credit_min * 60
+    effective_s = written_s + ai_credit_s
+    if not _time_out_of_tolerance(effective_s, target_s):
         return None
-    gap_s = target_s - generated_s
+    gap_s = target_s - effective_s
+    # The AI steps' credit is an estimate, so name it separately — the model can only
+    # change the written durations, and telling it the two numbers are one would make
+    # the requested adjustment wrong by exactly the credit.
+    credit_note = (
+        f" (that is {written_s:.0f}s of explicit wait/stir/cook commands plus about "
+        f"{ai_credit_s:.0f}s estimated for the AI-assisted 'cook ... till ...' step(s), "
+        f"whose duration you cannot set directly)"
+        if ai_credit_s else ""
+    )
     return (
-        f"Total active cook time is {generated_s:.0f} seconds, but the "
+        f"Total active cook time is {effective_s:.0f} seconds{credit_note}, but the "
         f"hardware-verified target for this dish ('{rag_ref['dish_name']}', "
         f"serving {matched_serving}) is {target_s:.0f} seconds. "
         f"{'Add' if gap_s > 0 else 'Remove'} approximately {abs(gap_s):.0f} "
@@ -422,12 +455,116 @@ def _check_tray_distribution(slots: list) -> list:
             scale = _TRAY_SCALE_FACTORS.get(ing.tray_class, _DEFAULT_TRAY_SCALE)
             eff_weight += (ing.quantity or 0) * scale
         if eff_weight > _MAX_TRAY_EFFECTIVE_G:
+            # With all 5 trays in use, "split into another tray" is impossible advice —
+            # a repair loop given only impossible options thrashes until its rounds run
+            # out (observed: 466g and 598g trays shipped after 3 wasted rounds). Name
+            # the only remedies that can actually work.
+            if len(slots) >= _MAX_TRAYS:
+                remedy = (
+                    f"All {_MAX_TRAYS} trays are already in use, so splitting into a new "
+                    f"tray is NOT possible. Either move some of its ingredients to an "
+                    f"existing tray with spare capacity (only if dispensed at the same "
+                    f"moment), or scale the ENTIRE recipe down — every ingredient and "
+                    f"the serving count together — until every tray fits, or set "
+                    f"nosh_compatible=false and explain in reason."
+                )
+            else:
+                remedy = (
+                    f"Split its ingredients across an additional consecutive tray, or "
+                    f"move some to a tray with spare capacity."
+                )
             issues.append(
                 f"Tray {s.number}'s effective weight is {eff_weight:.0f}g, exceeding the "
-                f"{_MAX_TRAY_EFFECTIVE_G}g limit. Split its ingredients across an additional "
-                f"consecutive tray, or move some to a tray with spare capacity."
+                f"{_MAX_TRAY_EFFECTIVE_G}g limit. {remedy}"
             )
     return issues
+
+
+# A same-moment split is the one tray repair that cannot change how the dish cooks:
+# the identical contents enter the pan at the identical instant, just from two cups.
+# So when the model exhausts its repair rounds with a tray still overweight and a
+# tray slot free, do that split deterministically instead of shipping a tray the
+# user physically cannot fill. Anything smarter (moving ingredients between cooking
+# moments) is NOT semantics-preserving and stays the model's job.
+
+def _slot_effective_weight(s):
+    """Effective grams for a slot, or None if any ingredient is non-gram/unweighted
+    (those slots already carry their own validator issue and cannot be reasoned about)."""
+    eff = 0.0
+    for ing in s.ingredients:
+        if not (ing.unit or "").strip().lower().startswith("g") or not ing.quantity:
+            return None
+        eff += ing.quantity * _TRAY_SCALE_FACTORS.get(ing.tray_class, _DEFAULT_TRAY_SCALE)
+    return eff
+
+
+def _auto_split_overweight_trays(output) -> bool:
+    """Split overweight trays into same-moment consecutive trays. Returns True if
+    anything changed. Stops when nothing is overweight or all trays are in use."""
+    changed = False
+    while True:
+        slots = sorted(output.slots or [], key=lambda s: s.number)
+        if len(slots) >= _MAX_TRAYS:
+            return changed
+        target = next(
+            (s for s in slots
+             if (w := _slot_effective_weight(s)) is not None and w > _MAX_TRAY_EFFECTIVE_G),
+            None,
+        )
+        if target is None:
+            return changed
+
+        def eff(ing):
+            return (ing.quantity or 0) * _TRAY_SCALE_FACTORS.get(ing.tray_class, _DEFAULT_TRAY_SCALE)
+
+        ings = sorted(target.ingredients, key=eff, reverse=True)
+        if len(ings) == 1:
+            # A single ingredient too heavy for one cup: split its MASS in half —
+            # same convention the prompt uses for oversized composites.
+            whole = ings[0]
+            half = round((whole.quantity or 0) / 2.0, 1)
+            keep = [whole.model_copy(update={"quantity": half})]
+            move = [whole.model_copy(update={"quantity": (whole.quantity or 0) - half})]
+        else:
+            # Greedy balance into two halves, heaviest first.
+            keep, move, keep_eff, move_eff = [], [], 0.0, 0.0
+            for ing in ings:
+                if keep_eff <= move_eff:
+                    keep.append(ing); keep_eff += eff(ing)
+                else:
+                    move.append(ing); move_eff += eff(ing)
+
+        k = target.number
+        for s in slots:
+            if s.number > k:
+                s.number += 1
+        target.ingredients = keep
+        new_slot = target.model_copy(update={"number": k + 1, "ingredients": move})
+        output.slots = sorted(slots + [new_slot], key=lambda s: s.number)
+
+        # Keep the commands in step: renumber every dispense above k, then dispense
+        # the new tray immediately after the original so both cups empty at the
+        # same cooking moment.
+        new_cmds = []
+        for cmd in (output.commands or []):
+            m = _TRAY_DISPENSE_RE.match(cmd.strip())
+            if m:
+                n = int(m.group(1))
+                if n > k:
+                    cmd = re.sub(r"\d+", str(n + 1), cmd, count=1)
+                new_cmds.append(cmd)
+                if n == k:
+                    new_cmds.append(f"ingredient_tray {k + 1} dispense")
+                continue
+            new_cmds.append(cmd)
+        output.commands = new_cmds
+
+        logger.warning(
+            f"Auto-split overweight tray {k} into trays {k} and {k + 1} "
+            f"(same dispense moment): "
+            f"{[i.ingredient_name for i in keep]} | {[i.ingredient_name for i in move]}."
+        )
+        changed = True
 
 
 # --- AI-assisted cooking eligibility --------------------------------------------
@@ -485,7 +622,7 @@ def _check_cook_before_dispense(output) -> list:
         if m:
             in_pan |= slot_ings.get(int(m.group(1)), set())
             continue
-        m = _COOK_AI_ING_RE.match(c)
+        m = _COOK_AI_RE.match(c)
         if m:
             ing = m.group(1).strip().lower()
             if not _pan_contains(ing, in_pan):
@@ -525,6 +662,29 @@ _VALIDATOR_ANCHORS = [(a, g) for a, g in _ANCHOR_SERVING_GRAMS if a != "potato"]
 _COLLAPSED_PREP_TAGS = ("marinated", "ground to paste")
 
 
+# Nosh's salt-dispense counts and rice water volumes are hardware-calibrated tables
+# keyed 1-4; there is no 5th or 6th entry to extrapolate from, and a pan that holds 4
+# servings does not hold 6. A larger count is not a preference to honour but a recipe
+# that must be scaled down before it can be cooked at all.
+_MAX_SERVING = 4
+
+
+def _check_serving_range(output) -> list:
+    serving = output.serving
+    if not serving or serving <= _MAX_SERVING:
+        return []
+    return [
+        f"The recipe claims {serving} servings, but Nosh's pan and its calibrated salt "
+        f"and water tables only go up to {_MAX_SERVING}. Scale the ENTIRE recipe down to "
+        f"{_MAX_SERVING} servings or fewer: multiply every ingredient quantity by "
+        f"{_MAX_SERVING}/{serving} and set serving to {_MAX_SERVING}. Here the whole "
+        f"recipe must move together — unlike a serving/quantity mismatch, nothing is "
+        f"wrong with the recipe's proportions, only its total size. Do not simply lower "
+        f"the serving number while leaving the quantities alone: that fills the trays "
+        f"for {serving} people and seasons the food for {_MAX_SERVING}."
+    ]
+
+
 def _check_serving_consistency(output) -> list:
     serving = output.serving
     if not serving or serving <= 0:
@@ -561,7 +721,8 @@ def _check_serving_consistency(output) -> list:
             f"~{per_serving}g per serving. Exactly one of the two numbers is wrong, so "
             f"change ONE of them: either (a) the {label} was shrunk to fit a tray — "
             f"restore its real quantity from the recipe, or (b) the quantity is right "
-            f"and the serving count is not — set serving to {max(1, round(implied))}. "
+            f"and the serving count is not — set serving to "
+            f"{min(_MAX_SERVING, max(1, round(implied)))}. "
             f"Do NOT rescale every ingredient and the serving count together: that "
             f"keeps the two in the same proportion and cannot resolve this. If the "
             f"recipe's real quantity cannot fit Nosh's 5 trays at any sensible serving "
@@ -669,6 +830,198 @@ def _check_oil_water_commands(output) -> list:
     return issues
 
 
+# --- water volume vs the RAG reference -----------------------------------------
+# The check above is only an overflow guard: any amount under 1500 ml passes, so a
+# dish can be dispensed 150 ml where the hardware-verified figure is 250 ml and
+# nothing objects. For a covered dish, moisture matters as much as time — a dense
+# ingredient steams tender on the water, and too little leaves it firm no matter how
+# long the pan runs. Same source and same authority rules as the cook-time check:
+# skipped for rice, where add_rice_specific_cmds overwrites the amount downstream.
+
+# Looser than cook time — absorbency genuinely varies with cut size and how much steam
+# the lid holds — but not so loose it only catches absurdities. Both directions hurt:
+# short leaves dense ingredients firm, long makes a dry sabzi soupy.
+_WATER_TOLERANCE_RATIO = 0.25
+_MIN_WATER_TARGET_ML = 50      # below this the reference is a splash, not a steaming volume
+
+# cmd_processor appends its own "water dispense 50 ml" after every AI-assisted onion or
+# tomato step (deglazing the browned base). That water is code-decided and invisible in
+# the commands we validate here, so it must be counted — otherwise this check demands
+# the model add water that the pipeline is already going to add for it.
+_POST_AI_WATER_ML = 50
+_POST_AI_WATER_INGS = ("onion", "tomato")
+
+
+def _check_water_volume(output, rag_ref: dict) -> list:
+    target_ml, matched_serving = pick_value_for_serving(
+        rag_ref.get("water_by_serving") or {}, output.serving
+    )
+    if not target_ml or target_ml < _MIN_WATER_TARGET_ML:
+        return []
+    commands = output.commands or []
+    if any(_COOK_RICE_RE.match(c.strip()) for c in commands):
+        return []  # rice water is code-decided downstream; never police it here
+    total_ml = 0.0
+    for c in commands:
+        c = c.strip()
+        m = _OIL_WATER_RE.match(c)
+        if m and m.group(1).lower() == "water":
+            try:
+                total_ml += float(m.group(2))
+            except ValueError:
+                return []  # malformed dispense is already reported by the check above
+            continue
+        m = _COOK_AI_RE.match(c)
+        if m and m.group(1).strip().lower() in _POST_AI_WATER_INGS:
+            total_ml += _POST_AI_WATER_ML  # cmd_processor will add this downstream
+    if abs(total_ml - target_ml) / target_ml <= _WATER_TOLERANCE_RATIO:
+        return []
+    gap = target_ml - total_ml
+    return [
+        f"The recipe dispenses {total_ml:.0f} ml of water in total, but the "
+        f"hardware-verified figure for this dish ('{rag_ref['dish_name']}', serving "
+        f"{matched_serving}) is {target_ml:.0f} ml. "
+        f"{'Add' if gap > 0 else 'Remove'} about {abs(gap):.0f} ml by adjusting the "
+        f"existing 'water dispense' amounts — too little water leaves dense "
+        f"ingredients underdone however long they cook, too much makes a dry dish "
+        f"soupy. Do not change ingredients, quantities, or step structure."
+    ]
+
+
+# --- spice presence ------------------------------------------------------------
+# An LLM round was observed dropping the ENTIRE seasoning block — salt, turmeric,
+# chilli powder, cumin powder, garam masala — while every other validator passed,
+# because _check_spice_commands polices the spice commands that exist, never the
+# ones that don't. A dish with correct timing and water but zero masala ships
+# looking perfect and tasting of nothing. So: every supported spice the recipe
+# text calls for must have a dispense command. Only fires for spices the recipe
+# itself mentions, so a dish that genuinely uses two spices isn't badgered into
+# eight. (cmd_processor's _insert_salt_dispense stays as the last-resort layer for
+# salt specifically, whose count is code-decided; the other spices' counts are the
+# model's call, so the repair loop is the right layer for them.)
+
+# Longest alias first, and each match masks its span before shorter aliases are
+# tried — otherwise "cumin powder" in the text would ALSO match the bare "cumin"
+# alias and falsely demand cumin seeds. Keys count as aliases (the model emits
+# "chilliPowder" verbatim), mirroring _is_supported_spice.
+_SPICE_ALIAS_KEY_PAIRS = sorted(
+    ((alias.lower(), key)
+     for key, aliases in _SPICE_ALIASES.items()
+     for alias in (*aliases, key)),
+    key=lambda p: -len(p[0]),
+)
+# Phrases that contain a spice word but are not the dispenser spice: "mustard oil"
+# must not demand a mustard-seed dispense. Masked out before alias matching.
+_SPICE_FALSE_FRIENDS = ("mustard oil",)
+
+
+def _spices_in_text(text: str) -> set:
+    t = (text or "").lower()
+    for phrase in _SPICE_FALSE_FRIENDS:
+        t = t.replace(phrase, " ")
+    found = set()
+    for alias, key in _SPICE_ALIAS_KEY_PAIRS:
+        pattern = re.compile(rf"\b{re.escape(alias)}\b")
+        if pattern.search(t):
+            found.add(key)
+            t = pattern.sub(" ", t)  # claim the span so shorter aliases can't re-match it
+    return found
+
+
+def _dispensed_spices(commands: list) -> set:
+    found = set()
+    for cmd in commands or []:
+        m = _SPICE_DISPENSE_RE.match(cmd.strip())
+        if not m:
+            continue
+        name = m.group(1).strip().lower()
+        for alias, key in _SPICE_ALIAS_KEY_PAIRS:
+            if re.search(rf"\b{re.escape(alias)}\b", name):
+                found.add(key)
+                break
+    return found
+
+
+def _check_spice_presence(output, recipe_text: str) -> list:
+    wanted = _spices_in_text(recipe_text)
+    if not wanted:
+        return []
+    missing = sorted(wanted - _dispensed_spices(output.commands))
+    if not missing:
+        return []
+    return [
+        f"The recipe calls for {', '.join(missing)} but the commands never dispense "
+        f"{'it' if len(missing) == 1 else 'them'} — no matching 'spice [name] dispense "
+        f"[N] times' exists. Add the missing dispense command(s) at the point the "
+        f"recipe adds each spice, with the food it seasons already in the pan, using "
+        f"the exact dispenser name(s): "
+        + "; ".join(f"'spice {m} dispense [N] times'" for m in missing) + "."
+    ]
+
+
+# --- staged ingredients sharing a tray ------------------------------------------
+# The prompt already says "same tray only if dispensed at the same moment AND same
+# cooking instruction", but nothing enforced it, and violating it for a STAGED
+# ingredient is physically self-defeating rather than merely untidy: a tray is
+# dispensed as a unit, so an ingredient the recipe cooks to a state as its own step
+# (onion browned golden, tomato cooked down soft) cannot reach that state with the
+# next step's bulk already in the pan. Onion sharing with tomato steams instead of
+# browning; tomato sharing with 200 g of cabbage never cooks down before the cabbage
+# hits. Deliberately narrow: a rule only fires when the recipe ITSELF stages that
+# ingredient, and co-tray items are allowed if the staging sentence names them
+# (added together by the recipe) or they are minor riders (whole spices, chillies).
+
+_STAGE_RULES = (
+    # (ingredient names, state words that mark a staging sentence)
+    (("onion", "shallot"), ("golden", "brown", "translucent", "caramel")),
+    (("tomato",), ("soft", "mushy", "pulpy")),
+)
+_MINOR_CO_TRAY_G = 15  # tempering-scale items riding along: bay leaf, chilli, cinnamon
+
+
+def _staging_sentences(recipe_text: str) -> list:
+    """(staged_names, sentence) for each sentence that cooks an ingredient to a state."""
+    out = []
+    for sentence in re.split(r"[.;\n]", (recipe_text or "").lower()):
+        for ings, words in _STAGE_RULES:
+            staged = [a for a in ings if a in sentence]
+            if staged and any(w in sentence for w in words):
+                out.append((staged, sentence))
+    return out
+
+
+def _check_staged_ingredient_trays(output, recipe_text: str) -> list:
+    stages = _staging_sentences(recipe_text)
+    if not stages:
+        return []
+    issues = []
+    for s in (output.slots or []):
+        names = [(i.ingredient_name.strip().lower(), i.quantity or 0) for i in s.ingredients]
+        for staged, sentence in stages:
+            anchor = next((n for n, _q in names if any(a in n for a in staged)), None)
+            if anchor is None:
+                continue
+            offenders = [
+                n for n, q in names
+                if n != anchor
+                and q > _MINOR_CO_TRAY_G                      # tempering riders are fine
+                and not any(a in n for a in staged)
+                # named in the staging sentence = the recipe adds them together
+                and not any(tok in sentence for tok in n.split())
+            ]
+            if offenders:
+                issues.append(
+                    f"Tray {s.number} holds {anchor} together with {', '.join(offenders)}, "
+                    f"but the recipe cooks the {anchor} to a stage on its own first "
+                    f"(\"{sentence.strip()}\"). A tray dispenses as a single unit, so "
+                    f"{', '.join(offenders)} would enter the pan at the same instant and "
+                    f"the {anchor} can never reach that stage. Move "
+                    f"{', '.join(offenders)} to a separate tray dispensed at the step "
+                    f"where the recipe actually adds {'it' if len(offenders) == 1 else 'them'}."
+                )
+    return issues
+
+
 def _run_deterministic_validators(output, rag_ref: dict, recipe_text: str) -> list:
     issues = []
     cook_time_issue = _check_cook_time(output, rag_ref, recipe_text)
@@ -678,9 +1031,20 @@ def _run_deterministic_validators(output, rag_ref: dict, recipe_text: str) -> li
     issues.extend(_check_tray_distribution(output.slots))
     issues.extend(_check_ai_commands(output))
     issues.extend(_check_cook_before_dispense(output))
-    issues.extend(_check_serving_consistency(output))
+    # An oversized recipe usually trips the anchor check too, but with the opposite
+    # remedy: the range check says "shrink the food to fit the pan", the consistency
+    # check says "raise the serving count to match the food". Emitting both in one
+    # repair round hands the model contradictory instructions, so the range check
+    # wins — resize first, then re-examine proportions on the next round.
+    serving_range_issues = _check_serving_range(output)
+    issues.extend(serving_range_issues)
+    if not serving_range_issues:
+        issues.extend(_check_serving_consistency(output))
     issues.extend(_check_dispense_coverage(output))
     issues.extend(_check_oil_water_commands(output))
+    issues.extend(_check_water_volume(output, rag_ref))
+    issues.extend(_check_spice_presence(output, recipe_text))
+    issues.extend(_check_staged_ingredient_trays(output, recipe_text))
     return issues
 
 
@@ -1035,6 +1399,10 @@ YOUR WORKFLOW (follow in order)
      "servings: 4"), use that number directly. If it does NOT state one, do NOT
      guess it yourself — call the estimate_serving_size tool (step 3) and use its
      result.
+   • Nosh cooks 1 to 4 servings — `serving` must never exceed 4. If the recipe
+     states more (e.g. "serves 6"), scale the WHOLE recipe down: multiply EVERY
+     ingredient quantity by 4/stated_serving and set serving=4. Scaling the count
+     without the quantities fills the trays for 6 people and seasons for 4.
    • List ALL ingredients with base_name, quantity, unit, preparation_step.
    • NORMALIZE PREPARATION (this makes prep output stable — follow exactly):
        - Each ingredient's preparation_step holds ONLY its own prep, canonical form:
@@ -1417,6 +1785,12 @@ def run_orchestrator(
                 break
         else:
             logger.warning(f"Exhausted {_MAX_REPAIR_ROUNDS} repair rounds; issues may remain.")
+
+        # Deterministic last resort: if the model left a tray overweight and a tray
+        # slot is free, do the same-moment split ourselves rather than shipping a
+        # cup the user physically cannot fill. Runs after the loop so the model
+        # always gets first crack at a smarter fix (moving items between moments).
+        _auto_split_overweight_trays(output)
 
         # Unconditional final re-check for logging/telemetry — the loop above
         # only measures issues BEFORE each repair, so the last repair's own

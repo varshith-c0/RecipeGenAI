@@ -157,7 +157,11 @@ _ANCHOR_SERVING_GRAMS = [
     ('fish', 150),
     ('prawns', 120),
     ('egg', 60),
-    ('rice', 75),
+    # 100 g matches the Nosh RAG corpus's own hardware-validated portions (400 g at
+    # 4 servings, 200 g at 2). The textbook 75 g figure made a stated "serves 2" with
+    # 300 g rice look like a 2x lie (implied 4.0) and _check_serving_consistency then
+    # inflated the serving count — which cascaded into 4 servings' worth of water.
+    ('rice', 100),
     ('toor dal', 40),
     ('moong dal', 40),
     ('chana dal', 40),

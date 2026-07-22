@@ -7,12 +7,68 @@ from .utils import logger, func_timing_decorator
 from .tracing import trace_function, add_span_attribute
 
 
+# Every calibrated table below (salt counts, rice water) is keyed 1-4 because that is
+# the range Nosh's pan was tuned over. A serving count outside it is a bug upstream,
+# not a value to extrapolate, so clamp it here rather than let a raw dict lookup raise.
+_MAX_SERV_SIZE = 4
+
+
+def _clamp_serv_size(serv_size, caller):
+    """Force serv_size into the 1-4 range these tables are calibrated for.
+
+    Clamping is damage limitation, not a fix: at serving 6 the trays hold 6 portions
+    of food but the rice gets 4 servings' worth of water. The orchestrator's serving
+    range check is what should stop this reaching us, so log loudly when it doesn't.
+    """
+    clamped = max(1, min(_MAX_SERV_SIZE, serv_size))
+    if clamped != serv_size:
+        logger.warning(
+            f"{caller}: serving size {serv_size} is outside the calibrated 1-{_MAX_SERV_SIZE} "
+            f"range; clamping to {clamped}. The dish will be cooked for {clamped} servings "
+            f"even though the trays are filled for {serv_size}."
+        )
+    return clamped
+
+
+_VEG_DISPENSE_RE = re.compile(r"^vegetable\s+\S+\s+dispense", re.IGNORECASE)
+_STOVE_STOP_RE = re.compile(r"^stove\s+stop", re.IGNORECASE)
+
+
+def _insert_salt_dispense(line_l, reqd_count):
+    """Add the missing salt dispense rather than shipping an unsalted dish.
+
+    This function's job is the salt COUNT, and it used to return untouched when there
+    were no salt commands to count — so an LLM round that simply forgot salt produced
+    food nobody would eat, silently. Salt quantity is already entirely code-decided
+    here, so the safe correction is to add it, not to preserve the omission.
+
+    Placement: right after the last ingredient dispense, so the salt lands on food
+    that is actually in the pan and before the stove stops. This is a fallback for a
+    generation fault the orchestrator's salt validator should have caught, so it is
+    logged rather than applied quietly.
+    """
+    anchor = next((i for i in range(len(line_l) - 1, -1, -1)
+                   if _VEG_DISPENSE_RE.match(line_l[i].strip())), None)
+    if anchor is None:
+        # Nothing dispensed from a tray — fall back to just before the stove stops.
+        anchor = next((i for i in range(len(line_l) - 1, -1, -1)
+                       if _STOVE_STOP_RE.match(line_l[i].strip())), len(line_l)) - 1
+    logger.warning(
+        f"No salt dispense in generated commands; inserting "
+        f"'spice salt dispense {reqd_count} times' after line {anchor} "
+        f"('{line_l[anchor].strip() if 0 <= anchor < len(line_l) else ''}')."
+    )
+    line_l[anchor + 1:anchor + 1] = [
+        "spice position 1 times",
+        f"spice salt dispense {reqd_count} times",
+        "spice rest 1 times",
+    ]
+    return line_l
+
+
 def fix_salt_dispense(line_l, consistency, serv_size):
     from .distribute_ingredients import Consistency # to prevent circular import
-    if serv_size < 1:
-        serv_size = 1
-    elif serv_size > 4:
-        serv_size = 4
+    serv_size = _clamp_serv_size(serv_size, "fix_salt_dispense")
 
     mapping = {
         Consistency.DRY       : {1: 1, 2: 2, 3: 3, 4: 4},
@@ -32,8 +88,8 @@ def fix_salt_dispense(line_l, consistency, serv_size):
             disp_cmd_idx_l.append(idx)
             disp_count_l.append(int(match.group(2)))
 
-    if not disp_cmd_idx_l: # if no salt dispense commmand
-        return line_l
+    if not disp_cmd_idx_l:  # no salt dispense command at all
+        return _insert_salt_dispense(line_l, reqd_count)
 
     total_count = sum(disp_count_l)
     if total_count == reqd_count:
@@ -67,9 +123,29 @@ def add_onion_specific_cmds(line_l):
         line_l.insert(ai_cmd_idx, "spice salt dispense 1 times")
     return line_l
 
-def add_rice_specific_cmds(line_l, serv_size):
+# The water table below was calibrated against 100 g of raw rice per serving (the
+# RAG corpus's own portions: 400 g at 4 servings, 200 g at 2). Water physically
+# follows the rice mass in the pan, not the serving label — if the two ever disagree
+# (e.g. an inflated serving count with the true rice amount), trusting the label
+# waterlogs or starves the rice.
+_RICE_G_PER_SERVING = 100
+
+
+def add_rice_specific_cmds(line_l, serv_size, rice_quant=None):
     ai_cmd_idx = line_l.index("cook rice till cooked")
-    new_water_quant = {1: 700, 2: 900, 3: 1100, 4: 1300}[serv_size]
+    serv_size = _clamp_serv_size(serv_size, "add_rice_specific_cmds")
+    water_key = serv_size
+    if rice_quant and rice_quant > 0:
+        # round half up, clamp to the calibrated 1-4 range
+        rice_servings = max(1, min(_MAX_SERV_SIZE, int(rice_quant / _RICE_G_PER_SERVING + 0.5)))
+        if rice_servings != serv_size:
+            logger.warning(
+                f"add_rice_specific_cmds: recipe says {serv_size} serving(s) but the trays "
+                f"hold {rice_quant:.0f}g of rice (~{rice_servings} serving(s) at "
+                f"{_RICE_G_PER_SERVING}g each); keying water off the rice mass."
+            )
+        water_key = rice_servings
+    new_water_quant = {1: 700, 2: 900, 3: 1100, 4: 1300}[water_key]
     pattern = re.compile(r"(water dispense (\d+) ml)")
     for i in range(ai_cmd_idx, -1, -1):
         if pattern.search(line_l[i]):
@@ -339,7 +415,10 @@ def run_cmd_processor(info_obj) -> str:
             ing_name, quant, unit, prepStep = ing_d['ingredient_name'], ing_d['quantity'], ing_d['unit'], ing_d['preparation_step']
             ing_name = ing_name.strip().lower()
             if "rice" in ing_name and ing_name not in ['rice flour', 'puffed rice', 'cooked rice']: # temporary fix TODO
-                rice_quant = float(quant)
+                # SUM, not assign: rice is routinely split across trays by the 400g
+                # effective-weight cap (two 150g trays), and keeping only the last
+                # entry would halve the water calculation downstream.
+                rice_quant = (rice_quant or 0.0) + float(quant)
             # Render empty/"None" prep as blank so the slot line stays clean.
             prep_disp = "" if prepStep is None or str(prepStep).strip().lower() in ("", "none") else str(prepStep).strip()
             slot_cmd_l_map[slot_id].append(f"# \t{ing_name} | {_fmt_qty(quant)} {unit} | {prep_disp}")
@@ -459,7 +538,7 @@ def run_cmd_processor(info_obj) -> str:
     if onion_ai_used:
         ret_line_l = add_onion_specific_cmds(ret_line_l)
     if rice_ai_used:
-        ret_line_l = add_rice_specific_cmds(ret_line_l, serv_size)
+        ret_line_l = add_rice_specific_cmds(ret_line_l, serv_size, rice_quant)
     ret_line_l = enclose_and_sanitize_spice_blocks(ret_line_l)
     ret_line_l = fix_salt_dispense(ret_line_l, consistency, serv_size)
     ret_line_l = process_cook_cmd(ret_line_l)
