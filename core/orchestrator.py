@@ -498,6 +498,130 @@ def _slot_effective_weight(s):
     return eff
 
 
+# 'cook rice till cooked' drives Nosh's RAW-rice program: cmd_processor keys a
+# large calibrated water dispense (700-1300 ml) off it and runs a full rice cook
+# cycle. Aimed at rice that is already cooked (fried-rice recipes), that floods
+# the pan and recooks the rice to mush. Catch it deterministically so the repair
+# loop makes the model swap it for plain toss/heat-through steps.
+
+_NON_RAW_RICE_NAMES = ("rice flour", "puffed rice", "rice cake", "rice paper")
+_PRECOOKED_PREP_WORDS = ("cooked", "boiled", "steamed", "leftover")
+
+
+def _has_raw_rice_in_trays(output) -> bool:
+    for s in (output.slots or []):
+        for ing in s.ingredients:
+            name = ing.ingredient_name.strip().lower()
+            if "rice" not in name or any(n in name for n in _NON_RAW_RICE_NAMES):
+                continue
+            prep = (ing.preparation_step or "").lower()
+            if any(w in name for w in _PRECOOKED_PREP_WORDS) or \
+               any(w in prep for w in _PRECOOKED_PREP_WORDS):
+                continue  # pre-cooked rice, not raw
+            return True
+    return False
+
+
+def _check_cooked_rice_ai_command(output) -> list:
+    issues = []
+    if _has_raw_rice_in_trays(output):
+        return issues
+    for c in (output.commands or []):
+        m = _COOK_AI_RE.match(c.strip())
+        if m and "rice" in m.group(1).lower():
+            issues.append(
+                f"The command '{c.strip()}' runs Nosh's raw-rice program (a large "
+                f"calibrated water dispense plus a full cook cycle), but this "
+                f"recipe's rice is already cooked — there is no raw rice in any "
+                f"tray. Running it would flood the dish and recook the rice to "
+                f"mush. Remove this command; instead heat the cooked rice through "
+                f"with 'stir mix ... times' and short 'wait ... seconds' steps "
+                f"after its dispense."
+            )
+    return issues
+
+
+# A marinade is applied to its target ingredients during USER PREP — once other
+# tray ingredients carry a 'marinated' prep step, the marinade's mass is already
+# coating them. A separate 'marinade' tray then double-counts every marinade
+# component AND pours raw marinade into hot oil ahead of the food, where it
+# burns before the actual ingredients arrive (observed on a dry paneer tikka).
+
+_MARINADE_NAMES = ("marinade", "marination")
+
+
+def _check_marinade_double_dispense(output) -> list:
+    issues = []
+    slots = output.slots or []
+    marinated_items = sorted({
+        ing.ingredient_name for s in slots for ing in s.ingredients
+        if "marinat" in (ing.preparation_step or "").lower()
+        and not any(w in ing.ingredient_name.strip().lower() for w in _MARINADE_NAMES)
+    })
+    if not marinated_items:
+        # No tray ingredient is marked marinated — a standalone marinade/sauce
+        # tray may then be a legitimate design choice; leave it alone.
+        return issues
+    for s in slots:
+        for ing in s.ingredients:
+            if any(w in ing.ingredient_name.strip().lower() for w in _MARINADE_NAMES):
+                issues.append(
+                    f"Tray {s.number} dispenses '{ing.ingredient_name}' "
+                    f"({ing.quantity} {ing.unit or ''}) as a separate tray ingredient, "
+                    f"but {', '.join(marinated_items)} are already marked 'marinated' — "
+                    f"the marinade is coated onto them during user prep "
+                    f"(prep_instructions), so dispensing it again double-counts its "
+                    f"ingredients and pours raw marinade into hot oil before the food, "
+                    f"where it will burn. Remove '{ing.ingredient_name}' from the trays "
+                    f"entirely (the marinade lives in prep_instructions only), remove "
+                    f"its dispense command, and renumber the remaining trays and "
+                    f"commands to stay consecutive."
+                )
+    return issues
+
+
+def _overweight_trays(output) -> list:
+    """(tray_number, effective_grams) for every tray over the limit. Slots with
+    non-gram/unweighted ingredients report None from _slot_effective_weight and
+    are skipped — they already carry their own validator issue."""
+    return [
+        (s.number, w) for s in (output.slots or [])
+        if (w := _slot_effective_weight(s)) is not None and w > _MAX_TRAY_EFFECTIVE_G
+    ]
+
+
+def _max_feasible_serving(output) -> int | None:
+    """Largest serving count whose scaled-down ingredients could plausibly fit
+    the trays, from total effective weight vs. total tray capacity. Assumes
+    oversized ingredients can be split across trays (the auto-split's same-
+    moment split), so total capacity — not the single-tray limit — is the
+    binding constraint. An estimate, not a proof: the retry re-runs the full
+    pipeline, which re-validates for real. None if even 1 serving can't fit
+    or the current serving count is unknown."""
+    serving = output.serving
+    if not serving:
+        return None
+    total_eff = 0.0
+    for s in (output.slots or []):
+        w = _slot_effective_weight(s)
+        if w is not None:
+            total_eff += w
+    if total_eff <= 0:
+        return None
+    # Raw capacity is unreachable in practice: splitting an oversized
+    # ingredient across trays quantizes space (750g of chicken occupies two
+    # trays but fills neither), and small ingredients can't share a tray with
+    # a different dispense moment. 0.85 keeps the suggestion at a serving
+    # count the packing can actually realize — for the reference 4-serving
+    # biryani (≈2600g effective) it suggests 2, which the model verifiably
+    # packs, where the unmargined floor suggests 3, which it cannot.
+    packing_efficiency = 0.85
+    capacity = _MAX_TRAYS * _MAX_TRAY_EFFECTIVE_G * packing_efficiency
+    feasible = int(serving * capacity / total_eff)  # floor
+    feasible = min(feasible, _MAX_SERVING, serving - 1)
+    return feasible if feasible >= 1 else None
+
+
 def _auto_split_overweight_trays(output) -> bool:
     """Split overweight trays into same-moment consecutive trays. Returns True if
     anything changed. Stops when nothing is overweight or all trays are in use."""
@@ -1030,6 +1154,8 @@ def _run_deterministic_validators(output, rag_ref: dict, recipe_text: str) -> li
     issues.extend(_check_spice_commands(output.commands))
     issues.extend(_check_tray_distribution(output.slots))
     issues.extend(_check_ai_commands(output))
+    issues.extend(_check_cooked_rice_ai_command(output))
+    issues.extend(_check_marinade_double_dispense(output))
     issues.extend(_check_cook_before_dispense(output))
     # An oversized recipe usually trips the anchor check too, but with the opposite
     # remedy: the range check says "shrink the food to fit the pan", the consistency
@@ -1556,7 +1682,8 @@ YOUR WORKFLOW (follow in order)
 # ── Prompt builder ─────────────────────────────────────────────────────────────
 
 def _build_prompt(recipe_text: str, rag_context: str,
-                  is_ing_check: bool, is_instr_check: bool) -> str:
+                  is_ing_check: bool, is_instr_check: bool,
+                  target_serving: int | None = None) -> str:
     strictness = []
     if is_ing_check:
         strictness.append(
@@ -1579,9 +1706,22 @@ def _build_prompt(recipe_text: str, rag_context: str,
         if rag_context else ""
     )
 
+    serving_block = ""
+    if target_serving:
+        serving_block = (
+            f"\n# Required Serving Count\n"
+            f"The user requires EXACTLY {target_serving} serving(s). Scale EVERY "
+            f"ingredient quantity proportionally from the recipe's own serving "
+            f"count to {target_serving} serving(s), set serving={target_serving}, "
+            f"and size all commands (water, oil, spices, cook times) for "
+            f"{target_serving} serving(s). Do NOT call estimate_serving_size — "
+            f"the serving count is already decided.\n"
+        )
+
     return (
         f"# Recipe to Process\n\n{recipe_text.strip()}\n"
-        f"{rag_block}\n"
+        f"{rag_block}"
+        f"{serving_block}\n"
         f"# Validation Mode\n"
         + "\n".join(f"• {s}" for s in strictness)
         + "\n\nNow follow the workflow:\n"
@@ -1606,10 +1746,16 @@ def run_orchestrator(
     recipe_text: str,
     is_ing_check: bool,
     is_instr_check: bool,
+    target_serving: int | None = None,
 ) -> tuple:
     """
     Single LLM + tool-calling loop.
     Returns (OrchestratorOutput | None, reason | None, error | None).
+    `reason` is a plain string for most failures; recoverable failures (recipe
+    too large for the trays) return a dict {"reason", "error_code",
+    "max_feasible_serving"?} so the API can offer the user a retry-with-fewer-
+    servings flow. `target_serving`, when set, forces the model to scale the
+    whole recipe to exactly that many servings.
     """
     # ── Step 1: RAG retrieval (pure code) ────────────────────────────────────
     rag_ref = get_rag_reference(recipe_text)
@@ -1627,7 +1773,8 @@ def run_orchestrator(
     add_span_attribute("rag.dish_name", str(rag_ref.get("dish_name")))
     add_span_attribute("rag.cook_time_by_serving", str(rag_ref.get("cook_time_by_serving")))
 
-    prompt = _build_prompt(recipe_text, rag_context, is_ing_check, is_instr_check)
+    prompt = _build_prompt(recipe_text, rag_context, is_ing_check, is_instr_check,
+                           target_serving=target_serving)
     client = genai.Client(api_key=_GEMINI_API_KEY)
     tools = _make_tools()
 
@@ -1743,6 +1890,10 @@ def run_orchestrator(
         # rather than silently passed off as fully validated.
         last_model_content = final.candidates[0].content
         prev_issue_count = None
+        # Most recent output that still had populated slots. When the model
+        # refuses mid-repair it usually empties the slots, but the serving
+        # suggestion for the retry flow needs the pre-refusal tray weights.
+        last_slotted = output if output.slots else None
 
         for round_num in range(1, _MAX_REPAIR_ROUNDS + 1):
             issues = _run_deterministic_validators(output, rag_ref, recipe_text)
@@ -1780,11 +1931,38 @@ def run_orchestrator(
             try:
                 output = OrchestratorOutput.model_validate_json(repaired.text)
                 last_model_content = repaired.candidates[0].content
+                if output.slots:
+                    last_slotted = output
             except (ValidationError, json.JSONDecodeError) as e:
                 logger.warning(f"Repair round {round_num} produced invalid output, stopping: {e}")
                 break
         else:
             logger.warning(f"Exhausted {_MAX_REPAIR_ROUNDS} repair rounds; issues may remain.")
+
+        # A repair round may legitimately flip the verdict — e.g. the model
+        # realizes mid-repair that the recipe cannot fit the trays. The
+        # pre-loop compatibility check cannot see that, so re-check here;
+        # otherwise an output self-declared incompatible (often with emptied
+        # slots and zero commands) ships to the caller as a success.
+        if not output.is_recipe or not output.nosh_compatible:
+            logger.info(
+                f"Model declared output not shippable during repair: "
+                f"is_recipe={output.is_recipe}, nosh_compatible={output.nosh_compatible}."
+            )
+            # If the refusal is size-related (the last slotted output had
+            # overweight trays), attach the retry-with-fewer-servings hint —
+            # same shape as the overweight guard below.
+            src = output if output.slots else last_slotted
+            if src is not None and _overweight_trays(src):
+                payload = {
+                    "reason": output.reason or "Recipe could not be processed.",
+                    "error_code": "too_large",
+                }
+                suggested = _max_feasible_serving(src)
+                if suggested:
+                    payload["max_feasible_serving"] = suggested
+                return None, payload, None
+            return None, output.reason, None
 
         # Deterministic last resort: if the model left a tray overweight and a tray
         # slot is free, do the same-moment split ourselves rather than shipping a
@@ -1801,6 +1979,36 @@ def run_orchestrator(
             logger.warning(f"Shipping output with {len(final_issues)} unresolved issue(s): {final_issues}")
         else:
             logger.info("Final output passes all deterministic validators.")
+
+        # Deterministic guard: an overweight tray is not a quality nit — the
+        # hardware cup physically cannot hold it, so the cook would fail
+        # mid-run. If the model couldn't fix it across the repair rounds and
+        # the auto-split couldn't either (all trays in use), refuse honestly
+        # instead of shipping a recipe the machine cannot execute. Other
+        # unresolved issues (cook time, water) still ship best-effort above.
+        overweight = _overweight_trays(output)
+        if overweight:
+            detail = ", ".join(f"tray {n} holds {w:.0f}g effective" for n, w in overweight)
+            logger.warning(f"Refusing to ship physically impossible output: {detail}.")
+            add_span_attribute("orchestrator.refused_overweight_trays", str([n for n, _ in overweight]))
+            msg = (
+                f"This recipe's quantities are too large to fit Nosh's "
+                f"{_MAX_TRAYS} ingredient trays ({detail}; the limit is "
+                f"{_MAX_TRAY_EFFECTIVE_G}g effective per tray)."
+            )
+            payload = {"reason": msg, "error_code": "too_large"}
+            suggested = _max_feasible_serving(output)
+            if suggested:
+                payload["max_feasible_serving"] = suggested
+                payload["reason"] = (
+                    f"{msg} Try again with {suggested} serving(s) or fewer."
+                )
+            else:
+                payload["reason"] = (
+                    f"{msg} Try reducing the quantities or the number of "
+                    f"servings and submitting again."
+                )
+            return None, payload, None
 
         return output, None, None
 

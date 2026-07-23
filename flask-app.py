@@ -22,6 +22,20 @@ def process_recipe():
     is_ing_check_enabled = inp_j.get('ingredientCheck', True)
     is_instr_check_enabled = inp_j.get('instructionCheck', True)
 
+    # Optional: user-chosen serving count (1-4). Empty/absent means "auto" —
+    # the model decides from the recipe. Anything else is rejected up front.
+    target_serving = inp_j.get('requestedServings')
+    if target_serving in ("", None):
+        target_serving = None
+    else:
+        try:
+            target_serving = int(target_serving)
+        except (TypeError, ValueError):
+            return jsonify({"status": False, "output": "Servings must be a whole number between 1 and 4."})
+        if not 1 <= target_serving <= 4:
+            return jsonify({"status": False, "output": "Servings must be between 1 and 4."})
+    add_span_attribute("request.requested_servings", str(target_serving))
+
     add_span_attribute("request.has_recipe_text", bool(recipe_cnt))
     add_span_attribute("request.has_yt_link", bool(yt_link))
     add_span_attribute("request.recipe_text", recipe_cnt)
@@ -56,13 +70,24 @@ def process_recipe():
             return jsonify({"status": is_valid, "output": reason})
 
     is_valid, output = generate_recipe(
-        recipe_cnt, is_ing_check_enabled, is_instr_check_enabled
+        recipe_cnt, is_ing_check_enabled, is_instr_check_enabled,
+        target_serving=target_serving,
     )
 
     yt_recipe = recipe_cnt if yt_link else None
 
     add_span_attribute("output.success", is_valid)
-    add_span_attribute("output.output", output)
+    add_span_attribute("output.output", str(output))
+
+    if not is_valid and isinstance(output, dict):
+        # Recoverable failure: surface error_code / max_feasible_serving so the
+        # frontend can prefill the serving picker and offer a one-click retry.
+        resp = {"status": False, "yt_recipe": yt_recipe, "output": output.get("reason")}
+        for key in ("error_code", "max_feasible_serving"):
+            if key in output:
+                resp[key] = output[key]
+        return jsonify(resp)
+
     return jsonify({"status": is_valid, "yt_recipe": yt_recipe, "output": output})
 
 if __name__ == '__main__':

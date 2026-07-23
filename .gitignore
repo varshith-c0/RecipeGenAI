@@ -5,6 +5,7 @@ benchmarking/
 *.log
 app.log.1
 app.log.2
+app.log.3
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

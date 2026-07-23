@@ -414,7 +414,16 @@ def run_cmd_processor(info_obj) -> str:
         for ing_d in ing_l:
             ing_name, quant, unit, prepStep = ing_d['ingredient_name'], ing_d['quantity'], ing_d['unit'], ing_d['preparation_step']
             ing_name = ing_name.strip().lower()
-            if "rice" in ing_name and ing_name not in ['rice flour', 'puffed rice', 'cooked rice']: # temporary fix TODO
+            # Only RAW rice counts toward the water calculation. Substring match,
+            # not exact: 'cooked basmati rice' must be excluded just like
+            # 'cooked rice', and a prep step of 'cooked'/'boiled' marks the rice
+            # as pre-cooked even when the name is plain 'rice' (fried-rice
+            # recipes). Rice products that never cook like rice are also out.
+            _prep_l = (prepStep or "").strip().lower()
+            if ("rice" in ing_name
+                    and not any(x in ing_name for x in ("rice flour", "puffed rice", "rice cake", "rice paper"))
+                    and not any(w in ing_name for w in ("cooked", "boiled", "steamed", "leftover"))
+                    and not any(w in _prep_l for w in ("cooked", "boiled", "steamed", "leftover"))):
                 # SUM, not assign: rice is routinely split across trays by the 400g
                 # effective-weight cap (two 150g trays), and keeping only the last
                 # entry would halve the water calculation downstream.
@@ -538,7 +547,19 @@ def run_cmd_processor(info_obj) -> str:
     if onion_ai_used:
         ret_line_l = add_onion_specific_cmds(ret_line_l)
     if rice_ai_used:
-        ret_line_l = add_rice_specific_cmds(ret_line_l, serv_size, rice_quant)
+        if rice_quant:
+            ret_line_l = add_rice_specific_cmds(ret_line_l, serv_size, rice_quant)
+        else:
+            # 'cook rice till cooked' with NO raw rice in any tray (fried-rice
+            # recipes using pre-cooked rice). The old serving-keyed fallback
+            # dispensed a full raw-rice water load (700-1300 ml) into a dish
+            # that only needs tossing — never do that. The orchestrator
+            # validator asks the model to drop the command; if it still gets
+            # here, skip the water program and leave the commands as-is.
+            logger.warning(
+                "cook-rice AI command present but no raw rice found in trays "
+                "(pre-cooked rice recipe?); skipping raw-rice water program."
+            )
     ret_line_l = enclose_and_sanitize_spice_blocks(ret_line_l)
     ret_line_l = fix_salt_dispense(ret_line_l, consistency, serv_size)
     ret_line_l = process_cook_cmd(ret_line_l)

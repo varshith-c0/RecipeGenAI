@@ -34,7 +34,28 @@
             <input type="checkbox" id="instrCheck" class="w-6 h-6 text-purple-600 border-gray-300 rounded focus:ring-purple-500" checked>
             Instruction Check
           </label>
+
+          <label class="flex items-center gap-2 text-gray-700">
+            Servings
+            <select id="servingSelect"
+              class="rounded-lg border border-gray-300 px-2 py-1 focus:outline-none focus:ring-2 focus:ring-purple-400">
+              <option value="" selected>Auto</option>
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+            </select>
+          </label>
         </div>
+      </div>
+
+      <!-- Retry hint (shown when a recipe is too large and a feasible serving count is known) -->
+      <div id="retryHint" class="hidden bg-amber-100 border border-amber-400 text-amber-800 rounded-lg px-4 py-3 text-sm">
+        <span id="retryHintText"></span>
+        <button id="retryBtn" onclick="retryWithSuggestedServings()"
+          class="ml-2 bg-amber-500 text-white px-3 py-1 rounded-lg hover:bg-amber-600 transition">
+          Retry
+        </button>
       </div>
 
       <div class="flex items-center gap-2">
@@ -60,12 +81,21 @@
   </div>
 
   <script>
+    function selectedServings() {
+      return document.getElementById('servingSelect').value || null;
+    }
+
+    function hideRetryHint() {
+      document.getElementById('retryHint').classList.add('hidden');
+    }
+
     async function processFromText() {
       await handleProcessing({
         recipeText: document.getElementById('recipeText').value,
         ytVideoLink: '',
         ingredientCheck: document.getElementById('ingCheck').checked,
         instructionCheck: document.getElementById('instrCheck').checked,
+        requestedServings: selectedServings(),
       }, 'processTextBtn');
     }
 
@@ -75,7 +105,15 @@
         ytVideoLink: document.getElementById('ytVideoLink').value,
         ingredientCheck: document.getElementById('ingCheck').checked,
         instructionCheck: document.getElementById('instrCheck').checked,
+        requestedServings: selectedServings(),
       }, 'processVideoBtn');
+    }
+
+    // Retry uses recipeText (the extracted recipe is written back into the
+    // textarea after a YT run), so the video is never re-processed.
+    async function retryWithSuggestedServings() {
+      hideRetryHint();
+      await processFromText();
     }
 
     async function handleProcessing(data, buttonId) {
@@ -83,6 +121,7 @@
       const processBtn = document.getElementById(buttonId);
 
       processBtn.disabled = true;
+      hideRetryHint();
       outputArea.classList.remove('ring-2', 'ring-green-400', 'ring-red-400');
       outputArea.value = "Processing...";
 
@@ -104,7 +143,16 @@
           outputArea.classList.add('ring-2', 'ring-green-400');
         } else {
           outputArea.classList.add('ring-2', 'ring-red-400');
-          alert(result.output);
+          if (result.max_feasible_serving) {
+            // Recoverable: prefill the serving picker with the server's
+            // suggestion and offer a one-click retry.
+            document.getElementById('servingSelect').value = String(result.max_feasible_serving);
+            document.getElementById('retryHintText').textContent =
+              `Recipe too large for Nosh. Retry with ${result.max_feasible_serving} serving(s)?`;
+            document.getElementById('retryHint').classList.remove('hidden');
+          } else {
+            alert(result.output);
+          }
         }
       } catch (error) {
         outputArea.value = "Error: Could not connect to server.";
@@ -114,8 +162,6 @@
         processBtn.disabled = false;
       }
     }
-
-    window.onload = toggleInputs;
   </script>
 </body>
 

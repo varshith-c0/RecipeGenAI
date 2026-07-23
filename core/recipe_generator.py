@@ -19,17 +19,21 @@ def run_recipe_generator(
     recipe_cnt: str,
     is_ing_check_enabled: bool,
     is_instr_check_enabled: bool,
+    target_serving: int | None = None,
 ):
     logger.info(
         f"Starting recipe generation (optimized agentic). "
         f"is_ing_check_enabled={is_ing_check_enabled}, "
-        f"is_instr_check_enabled={is_instr_check_enabled}"
+        f"is_instr_check_enabled={is_instr_check_enabled}, "
+        f"target_serving={target_serving}"
     )
     add_span_attribute("inputs.is_ing_check_enabled", is_ing_check_enabled)
     add_span_attribute("inputs.is_instr_check_enabled", is_instr_check_enabled)
+    add_span_attribute("inputs.target_serving", str(target_serving))
 
     output, reason, error = run_orchestrator(
-        recipe_cnt, is_ing_check_enabled, is_instr_check_enabled
+        recipe_cnt, is_ing_check_enabled, is_instr_check_enabled,
+        target_serving=target_serving,
     )
 
     if error is not None:
@@ -43,6 +47,12 @@ def run_recipe_generator(
         return False, {"reason": msg}
 
     if output is None:
+        # Recoverable failures (recipe too large for the trays) arrive as a
+        # dict carrying error_code / max_feasible_serving for the retry flow;
+        # everything else is a plain string.
+        if isinstance(reason, dict):
+            add_span_attribute("failure.failure_reason", str(reason.get("reason")))
+            return False, reason
         msg = reason or "Recipe could not be processed."
         add_span_attribute("failure.failure_reason", msg)
         return False, {"reason": msg}

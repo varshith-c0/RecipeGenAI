@@ -56,7 +56,7 @@ class GeminiLLM:
         input_txt: str,
         system_instruction: str,
         response_model: BaseModel,
-        thinking_mode: bool = False
+        thinking_mode: bool = True
     ):
         output = _generate_with_retry(
             model=self.model_id,

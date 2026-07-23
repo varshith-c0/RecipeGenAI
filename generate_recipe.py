@@ -3,12 +3,16 @@ from core.cmd_processor import run_cmd_processor
 from core.tracing import trace_function, add_span_attribute
 
 @trace_function("generate_recipe")
-def generate_recipe(recipe_cnt, is_ing_check_enabled, is_instr_check_enabled):
-    is_valid, info_obj = run_recipe_generator(recipe_cnt, is_ing_check_enabled, is_instr_check_enabled)
+def generate_recipe(recipe_cnt, is_ing_check_enabled, is_instr_check_enabled, target_serving=None):
+    is_valid, info_obj = run_recipe_generator(
+        recipe_cnt, is_ing_check_enabled, is_instr_check_enabled, target_serving=target_serving
+    )
 
     if not is_valid:
         add_span_attribute("failure.reason", info_obj['reason'])
-        return False, info_obj['reason']
+        # Return the whole dict — recoverable failures carry error_code /
+        # max_feasible_serving so the API can offer a retry-with-servings flow.
+        return False, info_obj
 
     p_cmd_str = run_cmd_processor(info_obj)
 
