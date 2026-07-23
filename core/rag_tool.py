@@ -1,25 +1,38 @@
+import hashlib
 import os
 import re
+import threading
+
+from cachetools import TTLCache
 from dotenv import load_dotenv
+
+from .gemini_client import get_gemini_client
 from .utils import logger
 
 load_dotenv()
 
 _QDRANT_URI = os.getenv("QDRANT_URI")
 _QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 COLLECTION_NAME = "recipes_v2"
 EMBEDDING_MODEL = "gemini-embedding-001"
 
+# Qdrant round-trip budget. The collection is small (610 docs) and local-ish
+# to the deployment, so a slow response is more likely "stuck" than "big
+# query" — fail fast and let the caller's except-and-degrade path take over.
+_QDRANT_QUERY_TIMEOUT_S = 5
+
 _qdrant_client = None
 _collection_available: bool | None = None
+_client_lock = threading.Lock()
 
 
 def _get_client():
     global _qdrant_client
     if _qdrant_client is None:
-        from qdrant_client import QdrantClient
-        _qdrant_client = QdrantClient(url=_QDRANT_URI, api_key=_QDRANT_API_KEY, check_compatibility=False)
+        with _client_lock:
+            if _qdrant_client is None:
+                from qdrant_client import QdrantClient
+                _qdrant_client = QdrantClient(url=_QDRANT_URI, api_key=_QDRANT_API_KEY, check_compatibility=False)
     return _qdrant_client
 
 
@@ -41,8 +54,7 @@ def _collection_exists() -> bool:
 
 
 def _embed(text: str) -> list[float]:
-    from google import genai
-    client = genai.Client(api_key=_GEMINI_API_KEY)
+    client = get_gemini_client()
     result = client.models.embed_content(model=EMBEDDING_MODEL, contents=text)
     return result.embeddings[0].values
 
@@ -148,21 +160,7 @@ _TIMING_CANDIDATES = 5
 _CONTEXT_DOCS = 3
 
 
-def get_rag_reference(query: str, top_k: int = _TIMING_CANDIDATES) -> dict:
-    """
-    Single retrieval call returning both:
-      - "context": the top _CONTEXT_DOCS payloads concatenated for prompt grounding,
-        led by the chosen timing reference.
-      - "cook_time_by_serving" / "water_by_serving" / "dish_name": from the SINGLE
-        best timing reference — the candidate chosen by _pick_timing_reference(),
-        which is vector rank 1 unless another retrieved dish covers this recipe's
-        ingredients clearly better. {serving_count: value} maps regex-extracted
-        (deterministic, no LLM involved) straight from its payload text. Empty dict
-        if no collection, no hits, or that match has no parseable per-serving block.
-        Serving count isn't known yet at retrieval time (it's resolved later in the
-        pipeline), so callers pick the right entry via pick_value_for_serving() once
-        they know it.
-    """
+def _get_rag_reference_uncached(query: str, top_k: int) -> dict:
     result = {"context": "", "cook_time_by_serving": {}, "water_by_serving": {}, "dish_name": None}
     if not _collection_exists():
         return result
@@ -172,6 +170,7 @@ def get_rag_reference(query: str, top_k: int = _TIMING_CANDIDATES) -> dict:
             collection_name=COLLECTION_NAME,
             query=query_vector,
             limit=top_k,
+            timeout=_QDRANT_QUERY_TIMEOUT_S,
         )
         if not results.points:
             return result
@@ -203,6 +202,56 @@ def get_rag_reference(query: str, top_k: int = _TIMING_CANDIDATES) -> dict:
     except Exception as e:
         logger.warning(f"RAG retrieval failed: {e}")
         return result
+
+
+# Recipe text rarely repeats verbatim, but when it does (retries, re-submits,
+# test loops), skipping the embed+Qdrant round trip is a pure win: the
+# collection is small and static-ish (610 docs), and the retrieval is a pure
+# function of the input text, so a cache hit carries no staleness risk. This
+# is intentionally NOT extended to the LLM/orchestrator output — that pipeline
+# is still actively evolving and a stale cached response there could bypass a
+# just-fixed validator.
+_rag_cache: TTLCache = TTLCache(maxsize=2048, ttl=3600)
+_rag_cache_lock = threading.Lock()
+rag_cache_hits = 0
+rag_cache_misses = 0
+
+
+def _normalize_query(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def get_rag_reference(query: str, top_k: int = _TIMING_CANDIDATES) -> dict:
+    """
+    Single retrieval call returning both:
+      - "context": the top _CONTEXT_DOCS payloads concatenated for prompt grounding,
+        led by the chosen timing reference.
+      - "cook_time_by_serving" / "water_by_serving" / "dish_name": from the SINGLE
+        best timing reference — the candidate chosen by _pick_timing_reference(),
+        which is vector rank 1 unless another retrieved dish covers this recipe's
+        ingredients clearly better. {serving_count: value} maps regex-extracted
+        (deterministic, no LLM involved) straight from its payload text. Empty dict
+        if no collection, no hits, or that match has no parseable per-serving block.
+        Serving count isn't known yet at retrieval time (it's resolved later in the
+        pipeline), so callers pick the right entry via pick_value_for_serving() once
+        they know it.
+
+    Results are cached in-process (TTL 1h) keyed on normalized query text + top_k —
+    see _rag_cache above for why this layer (and only this layer) is cache-safe.
+    """
+    global rag_cache_hits, rag_cache_misses
+    key = hashlib.sha256(f"{_normalize_query(query)}|{top_k}".encode()).hexdigest()
+    with _rag_cache_lock:
+        cached = _rag_cache.get(key)
+    if cached is not None:
+        rag_cache_hits += 1
+        return cached
+
+    rag_cache_misses += 1
+    result = _get_rag_reference_uncached(query, top_k)
+    with _rag_cache_lock:
+        _rag_cache[key] = result
+    return result
 
 
 def pick_value_for_serving(by_serving: dict, serving: int | None) -> tuple:

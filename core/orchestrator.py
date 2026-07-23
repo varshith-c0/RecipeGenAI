@@ -5,18 +5,14 @@ Replaces the 5-node LangGraph LLM pipeline with one reasoning LLM + tool-calling
   RAG retrieval (code) → LLM + tools (convert + validate) → post-process (code)
 """
 
-import os
 import re
 import json
-import time
-import random
 from enum import Enum
 from typing import Optional
 
 from dotenv import load_dotenv
-from google import genai
 from google.genai import types
-from google.genai.errors import ServerError, APIError
+from google.genai.errors import ServerError
 from pydantic import BaseModel, Field, ValidationError
 
 from core.rag_tool import (get_rag_reference, pick_cook_time_for_serving,
@@ -27,45 +23,13 @@ from core.ai_cmd_validator import ai_cmds_validator
 from core.distribute_ingredients import Slot, Ingredients, Consistency
 from core.cmd_generator import DistributionExtended, RecipeExtended
 from core.tracing import trace_function, add_span_attribute
+from core.gemini_client import get_gemini_client, generate_with_retry
 from .utils import logger, func_timing_decorator
 
 load_dotenv()
 
 _MODEL = "gemini-3.1-flash-lite"
 _MAX_TOOL_ROUNDS = 8
-_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-# Transient Gemini failures (502/503/504 overloads, 429 rate limits, 408 timeouts)
-# are server-side and self-heal on retry. Back off exponentially with jitter
-# before giving up, instead of failing the whole request on the first blip.
-_RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
-_MAX_API_RETRIES = 5
-_RETRY_BASE_DELAY = 2.0  # seconds; doubles each attempt
-
-
-def _generate_with_retry(client, **kwargs):
-    """Wrapper around client.models.generate_content that retries on transient
-    Gemini errors (5xx overloads like the 502 Bad Gateway, plus 429 rate limits).
-    Non-retryable errors (e.g. 400/401/404) and exhausted retries re-raise so the
-    caller's ServerError handler can still fail gracefully."""
-    last_err = None
-    for attempt in range(_MAX_API_RETRIES):
-        try:
-            return client.models.generate_content(**kwargs)
-        except APIError as e:
-            code = getattr(e, "code", None)
-            if not (isinstance(e, ServerError) or code in _RETRYABLE_STATUS):
-                raise
-            last_err = e
-            if attempt == _MAX_API_RETRIES - 1:
-                break
-            delay = _RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
-            logger.warning(
-                f"Gemini transient error (code={code}, attempt "
-                f"{attempt + 1}/{_MAX_API_RETRIES}); retrying in {delay:.1f}s"
-            )
-            time.sleep(delay)
-    raise last_err
 
 
 #  Output schema 
@@ -1628,7 +1592,7 @@ def run_orchestrator(
     add_span_attribute("rag.cook_time_by_serving", str(rag_ref.get("cook_time_by_serving")))
 
     prompt = _build_prompt(recipe_text, rag_context, is_ing_check, is_instr_check)
-    client = genai.Client(api_key=_GEMINI_API_KEY)
+    client = get_gemini_client()
     tools = _make_tools()
 
     config_tools = types.GenerateContentConfig(
@@ -1649,7 +1613,7 @@ def run_orchestrator(
         # ── Step 2: Tool-calling phase ────────────────────────────────────────
         tool_rounds = 0
         for _ in range(_MAX_TOOL_ROUNDS):
-            response = _generate_with_retry(
+            response = generate_with_retry(
                 client, model=_MODEL, contents=contents, config=config_tools,
             )
             if not response.candidates:
@@ -1699,7 +1663,7 @@ def run_orchestrator(
             role="user",
             parts=[types.Part(text="Output the complete JSON result now.")],
         ))
-        final = _generate_with_retry(
+        final = generate_with_retry(
             client, model=_MODEL, contents=contents, config=config_extract,
         )
 
@@ -1768,7 +1732,7 @@ def run_orchestrator(
             )
             contents.append(last_model_content)
             contents.append(types.Content(role="user", parts=[types.Part(text=repair_msg)]))
-            repaired = _generate_with_retry(
+            repaired = generate_with_retry(
                 client, model=_MODEL, contents=contents, config=config_extract,
             )
             if not repaired.text:
