@@ -27,6 +27,7 @@ from core.ai_cmd_validator import ai_cmds_validator
 from core.distribute_ingredients import Slot, Ingredients, Consistency
 from core.cmd_generator import DistributionExtended, RecipeExtended
 from core.tracing import trace_function, add_span_attribute
+from core.recipe_file_index import find_by_ingredients, find_by_id, format_as_rag_context, get_reference_signals
 from .utils import logger, func_timing_decorator
 
 load_dotenv()
@@ -77,6 +78,16 @@ class TrayClass(str, Enum):
     BONELESS_MEAT = "boneless_meat"
     BONE_IN_MEAT = "bone_in_meat"
     GRAIN = "grain"
+
+class CulinaryIssue(BaseModel):
+    category: str = Field(description="Issue category: cooking_order, water_amount, cook_time, heat_level, spice_timing, ingredient_handling")
+    description: str = Field(description="Specific actionable issue description")
+    severity: str = Field(description="high, medium, or low")
+
+class JudgeOutput(BaseModel):
+    rating: int = Field(description="1-10 culinary quality rating")
+    issues: list[CulinaryIssue] = Field(default=[], description="List of culinary issues found")
+    summary: str = Field(description="Brief overall assessment")
 
 class _IngredientOut(BaseModel):
     ingredient_name: str = Field(description="root name of the ingredient (e.g. 'tomato', 'onion')")
@@ -327,6 +338,51 @@ def _check_cook_time(output, rag_ref: dict, recipe_text: str) -> Optional[str]:
         f"proportionally (do not change ingredients, quantities, or step "
         f"structure)."
     )
+
+
+# --- cook time fallback from .recipe index when Qdrant has no data -----------
+# The Qdrant check requires a payload with per-serving timing blobs. When Qdrant
+# is unavailable or the dish is too novel to have a match, cook_time_by_serving
+# is empty and the cook-time check above silently passes everything. The .recipe
+# index gives us a second source: the total active cook time computed from the
+# best-matched verified recipe's commands. Wider tolerance (25%) vs. Qdrant (18%)
+# because this reference is scaled from a different dish, not the same dish.
+_RF_COOK_TIME_TOLERANCE = 0.25
+
+
+def _check_cook_time_from_recipe_files(
+    output, recipe_file_ref: dict, recipe_text: str
+) -> Optional[str]:
+    """Cook time validation using .recipe index (fallback when Qdrant has no timing data)."""
+    if not recipe_file_ref:
+        return None
+    if _has_explicit_total_time(recipe_text):
+        return None
+    ref_ct_s   = recipe_file_ref.get("cook_time_seconds", 0.0)
+    ref_serv   = recipe_file_ref.get("servings", 0)
+    if not ref_ct_s or not ref_serv:
+        return None
+
+    # Scale reference time proportionally to the output's serving count.
+    target_s = ref_ct_s * ((output.serving or ref_serv) / ref_serv)
+    written_min, ai_credit_min = _compute_total_active_minutes(output.commands)
+    effective_s = (written_min + ai_credit_min) * 60
+    if not effective_s:
+        return None
+    if abs(effective_s - target_s) / target_s <= _RF_COOK_TIME_TOLERANCE:
+        return None
+
+    gap_s = target_s - effective_s
+    return (
+        f"Total active cook time is {effective_s:.0f} seconds, but a similar "
+        f"verified recipe ('{recipe_file_ref['dish_name']}') runs ~{target_s:.0f} seconds "
+        f"at this serving count. "
+        f"{'Add' if gap_s > 0 else 'Remove'} approximately {abs(gap_s):.0f} "
+        f"seconds by adjusting existing wait/cook/stir durations proportionally "
+        f"(do not change ingredients, quantities, or step structure)."
+    )
+
+
 
 
 # --- spice-dispenser compatibility --------------------------------------------
@@ -954,62 +1010,32 @@ def _check_oil_water_commands(output) -> list:
     return issues
 
 
-# --- water volume vs the RAG reference -----------------------------------------
-# The check above is only an overflow guard: any amount under 1500 ml passes, so a
-# dish can be dispensed 150 ml where the hardware-verified figure is 250 ml and
-# nothing objects. For a covered dish, moisture matters as much as time — a dense
-# ingredient steams tender on the water, and too little leaves it firm no matter how
-# long the pan runs. Same source and same authority rules as the cook-time check:
-# skipped for rice, where add_rice_specific_cmds overwrites the amount downstream.
-
-# Looser than cook time — absorbency genuinely varies with cut size and how much steam
-# the lid holds — but not so loose it only catches absurdities. Both directions hurt:
-# short leaves dense ingredients firm, long makes a dry sabzi soupy.
-_WATER_TOLERANCE_RATIO = 0.25
-_MIN_WATER_TARGET_ML = 50      # below this the reference is a splash, not a steaming volume
-
-# cmd_processor appends its own "water dispense 50 ml" after every AI-assisted onion or
-# tomato step (deglazing the browned base). That water is code-decided and invisible in
-# the commands we validate here, so it must be counted — otherwise this check demands
-# the model add water that the pipeline is already going to add for it.
-_POST_AI_WATER_ML = 50
-_POST_AI_WATER_INGS = ("onion", "tomato")
+# --- uninterrupted wait limits ------------------------------------------------
+# Nosh has no lid and cooks open, so leaving food unstirred for too long leads
+# to hot spots, uneven cooking, and burning. The hardware requires any long wait
+# period to be split up and interleaved with stir commands.
+_MAX_UNINTERRUPTED_WAIT_S = 180  # 3 minutes maximum uninterrupted wait in open pan
 
 
-def _check_water_volume(output, rag_ref: dict) -> list:
-    target_ml, matched_serving = pick_value_for_serving(
-        rag_ref.get("water_by_serving") or {}, output.serving
-    )
-    if not target_ml or target_ml < _MIN_WATER_TARGET_ML:
-        return []
+def _check_long_waits(output) -> list:
+    """Flag raw wait commands that are too long without stirring."""
     commands = output.commands or []
-    if any(_COOK_RICE_RE.match(c.strip()) for c in commands):
-        return []  # rice water is code-decided downstream; never police it here
-    total_ml = 0.0
-    for c in commands:
-        c = c.strip()
-        m = _OIL_WATER_RE.match(c)
-        if m and m.group(1).lower() == "water":
-            try:
-                total_ml += float(m.group(2))
-            except ValueError:
-                return []  # malformed dispense is already reported by the check above
-            continue
-        m = _COOK_AI_RE.match(c)
-        if m and m.group(1).strip().lower() in _POST_AI_WATER_INGS:
-            total_ml += _POST_AI_WATER_ML  # cmd_processor will add this downstream
-    if abs(total_ml - target_ml) / target_ml <= _WATER_TOLERANCE_RATIO:
-        return []
-    gap = target_ml - total_ml
-    return [
-        f"The recipe dispenses {total_ml:.0f} ml of water in total, but the "
-        f"hardware-verified figure for this dish ('{rag_ref['dish_name']}', serving "
-        f"{matched_serving}) is {target_ml:.0f} ml. "
-        f"{'Add' if gap > 0 else 'Remove'} about {abs(gap):.0f} ml by adjusting the "
-        f"existing 'water dispense' amounts — too little water leaves dense "
-        f"ingredients underdone however long they cook, too much makes a dry dish "
-        f"soupy. Do not change ingredients, quantities, or step structure."
-    ]
+    issues = []
+    for cmd in commands:
+        c = cmd.strip()
+        m = _WAIT_RE.match(c)
+        if m:
+            seconds = float(m.group(1))
+            if seconds > _MAX_UNINTERRUPTED_WAIT_S:
+                issues.append(
+                    f"Command '{c}' has an uninterrupted wait of {seconds:.0f} seconds. "
+                    f"Nosh cooks in an open pan, so food will burn if left unstirred for "
+                    f"more than {_MAX_UNINTERRUPTED_WAIT_S} seconds. Split this long wait "
+                    f"into multiple shorter waits (each max 120 seconds) interleaved with "
+                    f"stir commands (e.g., 'stir mix 1 times') to keep the food moving and "
+                    f"distribute heat evenly."
+                )
+    return issues
 
 
 # --- spice presence ------------------------------------------------------------
@@ -1083,6 +1109,79 @@ def _check_spice_presence(output, recipe_text: str) -> list:
     ]
 
 
+# --- spice dispense count validation from .recipe index ----------------------
+# _check_spice_presence only verifies presence/absence; it cannot catch a LLM
+# that dispenses salt once for 4 servings (or 20 times for 2). The .recipe index
+# gives us per-serving reference counts from verified recipes with similar
+# ingredients — the only source for this signal (Qdrant has no spice counts).
+#
+# Tolerance is wide (40%-200%) because spice preference is personal and the
+# reference dish is only SIMILAR, not identical. The validator fires only for
+# counts that are wildly wrong — e.g. 1 salt dispense for a 4-serving curry that
+# references 6, which would produce nearly unseasoned food.
+
+_SPICE_COUNT_MIN_RATIO  = 0.4    # below 40% of expected → too few
+_SPICE_COUNT_MAX_RATIO  = 2.0    # above 200% of expected → too many
+_MIN_SPICE_REF_PER_SERV = 1.0    # ignore reference spices with < 1 dispense/serving
+_MIN_SPICE_REF_OVERLAP  = 0.35   # require at least 35% ingredient overlap to trust counts
+
+
+def _check_spice_counts_from_recipe_files(output, recipe_file_ref: dict) -> list:
+    """Flag spice dispense counts that are wildly off vs. the .recipe index reference."""
+    if not recipe_file_ref:
+        return []
+    if recipe_file_ref.get("overlap_score", 0) < _MIN_SPICE_REF_OVERLAP:
+        return []  # reference dish too different to be authoritative
+    serving = output.serving or 1
+    ref_per_serving = recipe_file_ref.get("spice_counts_per_serving", {})
+    if not ref_per_serving:
+        return []
+
+    # Collect LLM's actual dispense totals, canonicalised via _SPICE_ALIASES.
+    llm_counts: dict[str, int] = {}  # {canonical_key: total_dispenses}
+    for cmd in (output.commands or []):
+        m = _SPICE_DISPENSE_RE.match(cmd.strip())
+        if not m:
+            continue
+        raw_name = m.group(1).strip().lower()
+        # Canonicalise: find the _SPICE_ALIASES key that this name maps to.
+        for canon_key, aliases in _SPICE_ALIASES.items():
+            if re.search(rf"\b{re.escape(canon_key.lower())}\b", raw_name) or any(
+                re.search(rf"\b{re.escape(a)}\b", raw_name, re.IGNORECASE) for a in aliases
+            ):
+                llm_counts[canon_key] = llm_counts.get(canon_key, 0) + int(m.group(2))
+                break
+
+    issues = []
+    for ref_name, per_serv in ref_per_serving.items():
+        if per_serv < _MIN_SPICE_REF_PER_SERV:
+            continue  # reference too thin to be meaningful
+        expected = per_serv * serving
+
+        # Match ref_name (e.g. 'corianderPowder') to the canonicalised LLM count.
+        llm_count = 0
+        for canon_key, count in llm_counts.items():
+            if canon_key.lower() == ref_name.lower():
+                llm_count += count
+        if llm_count == 0:
+            continue  # absence already handled by _check_spice_presence
+
+        ratio = llm_count / expected
+        if _SPICE_COUNT_MIN_RATIO <= ratio <= _SPICE_COUNT_MAX_RATIO:
+            continue
+
+        direction = "far too few" if llm_count < expected else "far too many"
+        issues.append(
+            f"Spice '{ref_name}': {llm_count} dispense(s) for {serving} serving(s), "
+            f"but the verified reference recipe '{recipe_file_ref['dish_name']}' "
+            f"uses ~{expected:.0f} dispense(s) at this serving count "
+            f"({per_serv:.1f}/serving) — that is {direction}. "
+            f"Adjust 'spice {ref_name} dispense N times' proportionally unless "
+            f"the recipe explicitly calls for an unusual spice level."
+        )
+    return issues
+
+
 # --- staged ingredients sharing a tray ------------------------------------------
 # The prompt already says "same tray only if dispensed at the same moment AND same
 # cooking instruction", but nothing enforced it, and violating it for a STAGED
@@ -1146,31 +1245,45 @@ def _check_staged_ingredient_trays(output, recipe_text: str) -> list:
     return issues
 
 
-def _run_deterministic_validators(output, rag_ref: dict, recipe_text: str) -> list:
+def _run_deterministic_validators(
+    output,
+    rag_ref: dict,
+    recipe_text: str,
+    recipe_file_ref: dict | None = None,
+) -> list:
     issues = []
+    recipe_file_ref = recipe_file_ref or {}
+
+    # Cook time: Qdrant first, .recipe file as fallback when Qdrant has no data.
     cook_time_issue = _check_cook_time(output, rag_ref, recipe_text)
+    if not cook_time_issue and not rag_ref.get("cook_time_by_serving"):
+        cook_time_issue = _check_cook_time_from_recipe_files(
+            output, recipe_file_ref, recipe_text
+        )
     if cook_time_issue:
         issues.append(cook_time_issue)
+
     issues.extend(_check_spice_commands(output.commands))
     issues.extend(_check_tray_distribution(output.slots))
     issues.extend(_check_ai_commands(output))
     issues.extend(_check_cooked_rice_ai_command(output))
     issues.extend(_check_marinade_double_dispense(output))
     issues.extend(_check_cook_before_dispense(output))
-    # An oversized recipe usually trips the anchor check too, but with the opposite
-    # remedy: the range check says "shrink the food to fit the pan", the consistency
-    # check says "raise the serving count to match the food". Emitting both in one
-    # repair round hands the model contradictory instructions, so the range check
-    # wins — resize first, then re-examine proportions on the next round.
     serving_range_issues = _check_serving_range(output)
     issues.extend(serving_range_issues)
     if not serving_range_issues:
         issues.extend(_check_serving_consistency(output))
     issues.extend(_check_dispense_coverage(output))
     issues.extend(_check_oil_water_commands(output))
-    issues.extend(_check_water_volume(output, rag_ref))
     issues.extend(_check_spice_presence(output, recipe_text))
     issues.extend(_check_staged_ingredient_trays(output, recipe_text))
+    issues.extend(_check_long_waits(output))
+
+    # Spice count validation — unique to .recipe index, no Qdrant equivalent.
+    # Runs last so _check_spice_presence (presence/absence) is already reported
+    # and the count check focuses only on spices that ARE dispensed.
+    issues.extend(_check_spice_counts_from_recipe_files(output, recipe_file_ref))
+
     return issues
 
 
@@ -1679,11 +1792,81 @@ YOUR WORKFLOW (follow in order)
 """
 
 
+def _extract_raw_ingredient_names(recipe_text: str) -> list[str]:
+    """Helper to robustly extract clean, lowercase ingredient names from recipe text.
+    
+    Finds the ingredients section and strips leading bullets, quantities, units,
+    and parenthetical preparation descriptors (e.g. 'thinly sliced', 'Chopped').
+    """
+    lines = recipe_text.splitlines()
+    ing_lines = []
+    in_ingredients = False
+    
+    for line in lines:
+        l_lower = line.lower()
+        if 'ingredients' in l_lower:
+            in_ingredients = True
+            continue
+        if in_ingredients:
+            if any(h in l_lower for h in ['instruction', 'direction', 'step', 'method', 'preparation']):
+                break
+            if re.match(r'^\s*\d+[\.\)]', line):
+                break
+            ing_lines.append(line)
+            
+    if not ing_lines:
+        ing_lines = lines
+
+    ingredients = []
+    # Match quantity values with optional trailing units
+    qty_pattern = re.compile(
+        r'\b(?:\d+(?:\.\d+)?|\d+/\d+)\s*(?:gms?|g|ml|cups?|tsps?|tbsps?|pieces?|pcs?|units?|pinch|to-taste|to taste)?\b',
+        re.IGNORECASE
+    )
+    unit_only_pattern = re.compile(
+        r'\b(?:gms?|g|ml|cups?|tsps?|tbsps?|pieces?|pcs?|units?|pinch|to-taste|to taste)\b',
+        re.IGNORECASE
+    )
+
+    for line in ing_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        
+        # Remove bullet markers, numbers, or dots at start
+        stripped = re.sub(r'^[-•*\d\.\s]+', '', stripped).strip()
+        if not stripped:
+            continue
+            
+        # Strip parentheticals
+        stripped = re.sub(r'\(.*?\)', '', stripped).strip()
+        
+        # Split on separators like " - ", " : ", " , " to isolate name from quantity/note
+        parts = re.split(r'[-:,]', stripped, maxsplit=1)
+        name_candidate = parts[0].strip()
+        
+        # Clean quantity words and units
+        name_candidate = qty_pattern.sub('', name_candidate)
+        name_candidate = unit_only_pattern.sub('', name_candidate)
+        name_candidate = re.sub(r'\s+', ' ', name_candidate).strip()
+        
+        # Remove common leading preposition garbage
+        name_candidate = re.sub(r'^(?:of|and|with)\s+', '', name_candidate, flags=re.IGNORECASE)
+        name_candidate = re.sub(r'\s+(?:for garnish|to taste)$', '', name_candidate, flags=re.IGNORECASE)
+        
+        if name_candidate and len(name_candidate) > 1:
+            ingredients.append(name_candidate.lower())
+            
+    return list(dict.fromkeys(ingredients))
+
+
+
 # ── Prompt builder ─────────────────────────────────────────────────────────────
 
 def _build_prompt(recipe_text: str, rag_context: str,
                   is_ing_check: bool, is_instr_check: bool,
-                  target_serving: int | None = None) -> str:
+                  target_serving: int | None = None,
+                  recipe_file_context: str = "") -> str:
     strictness = []
     if is_ing_check:
         strictness.append(
@@ -1706,6 +1889,18 @@ def _build_prompt(recipe_text: str, rag_context: str,
         if rag_context else ""
     )
 
+    # Second RAG source: verified command patterns from local .recipe files.
+    # Labelled separately so the LLM understands these are exact Nosh DSL commands
+    # (tray numbers, spice dispense counts, stir/wait sequences) — not narrative prose.
+    recipe_file_block = (
+        f"\n# Verified Nosh Command Patterns (from .recipe index)\n"
+        f"The following command sequences are extracted verbatim from validated "
+        f".recipe files for dishes with overlapping ingredients. Prefer these exact "
+        f"sequences over free-form inference for tray assignments, spice counts, and "
+        f"cook/wait timings:\n\n{recipe_file_context}\n"
+        if recipe_file_context else ""
+    )
+
     serving_block = ""
     if target_serving:
         serving_block = (
@@ -1721,6 +1916,7 @@ def _build_prompt(recipe_text: str, rag_context: str,
     return (
         f"# Recipe to Process\n\n{recipe_text.strip()}\n"
         f"{rag_block}"
+        f"{recipe_file_block}"
         f"{serving_block}\n"
         f"# Validation Mode\n"
         + "\n".join(f"• {s}" for s in strictness)
@@ -1731,11 +1927,157 @@ def _build_prompt(recipe_text: str, rag_context: str,
           "for that ingredient's cook step.\n"
           "3. If the recipe text does not explicitly state a serving count, also "
           "call estimate_serving_size with the same ingredients and use its result.\n"
-          "4. Distribute into slots and write updated_instructions.\n"
-          "5. Generate commands.\n"
+          "4. Distribute into slots and write updated_instructions. Treat the matched "
+          "recipes in '# Verified Nosh Command Patterns' as few-shot templates: follow "
+          "their tray assignments, command sequence style, and spice dispense patterns.\n"
+          "5. Generate commands matching the timing, water levels, and spice ratios "
+          "from the verified examples (scaled for the serving count).\n"
           "6. Call validate_nosh_commands; fix any flagged commands.\n"
           "7. Return complete JSON."
     )
+
+
+_JUDGE_SYSTEM_INSTRUCTION = r"""
+You are the **Nosh Culinary Quality Judge**.
+
+Your task is to review the cooking process of a recipe and rate its culinary quality (1-10) and identify any culinary issues.
+
+Nosh is an autonomous single-pot cooking robot. Keep in mind:
+- It cooks in a single open pan (no lid is used, so water evaporates).
+- It cannot perform manual actions like rolling/kneading, pressure-cooking, straining, or transferring ingredients.
+- Trays dispense all their contents at once.
+
+Evaluate the recipe's instructions and commands based on sound culinary principles:
+1. **Cooking Order**: Whole spices should bloom first, aromatics/onions should brown before tomatoes/wet ingredients are added, hard vegetables (potatoes, carrots) must start cooking before delicate ones (paneer, spinach).
+2. **Water Adequacy**: Is there enough water to cook hard ingredients or produce the required gravy consistency? Conversely, is there too much water for a dry dish?
+3. **Cook Times**: Are the durations reasonable for the ingredient types and quantities? (e.g. raw potatoes need more time than pre-cooked paneer).
+4. **Heat Management**: Is heat adjusted logically? (e.g. moderate for sauteing, low/gentle for dairy/cream to avoid curdling, high for boiling).
+5. **Spice Timing**: Are whole spices bloomed in oil first? Are ground spices added with or after wet ingredients so they don't burn?
+6. **Ingredient Handling**: Are delicate ingredients added at the end? Are raw meats cooked thoroughly?
+
+Return a JSON conforming to the `JudgeOutput` schema containing:
+- `rating`: A culinary score from 1 to 10. A score of 8+ means it is a restaurant-quality dish ready to cook.
+- `issues`: A list of culinary issues. If there are none, return an empty list. Each issue should have:
+  - `category`: one of cooking_order, water_amount, cook_time, heat_level, spice_timing, ingredient_handling
+  - `description`: A specific, clear, and actionable explanation of what is wrong and how to fix it (e.g., "Increase the cooking time of potatoes to at least 15 minutes before adding tomatoes", "Add the cream at the very end on low heat").
+  - `severity`: high, medium, or low
+- `summary`: A brief summary of your evaluation.
+
+Do not write code, Nosh DSL commands, or slot details in the descriptions. Keep descriptions focused on culinary instructions.
+"""
+
+
+def _run_culinary_judge(output: OrchestratorOutput, client) -> JudgeOutput:
+    """
+    Translates the Nosh command script into a plain-English cooking process,
+    calls the Gemini Judge LLM to evaluate the culinary quality, and returns
+    the rating and issues.
+    """
+    slots_map = {}
+    for s in (output.slots or []):
+        ing_details = []
+        for i in s.ingredients:
+            prep = f" ({i.preparation_step})" if i.preparation_step else ""
+            ing_details.append(f"{i.ingredient_name}{prep}: {i.quantity} {i.unit or ''}")
+        slots_map[s.number] = ", ".join(ing_details)
+
+    translated = []
+    for cmd in (output.commands or []):
+        cmd = cmd.strip()
+        if cmd == "stove start":
+            translated.append("Start the stove.")
+        elif cmd == "stove stop":
+            translated.append("Stop the stove.")
+        elif cmd.startswith("oil dispense"):
+            m = re.match(r"oil dispense\s+(\d+)\s+ml", cmd)
+            if m:
+                translated.append(f"Dispense {m.group(1)} ml oil.")
+            else:
+                translated.append(cmd)
+        elif cmd.startswith("water dispense"):
+            m = re.match(r"water dispense\s+(\d+)\s+ml", cmd)
+            if m:
+                translated.append(f"Dispense {m.group(1)} ml water.")
+            else:
+                translated.append(cmd)
+        elif cmd.startswith("spice"):
+            m = re.match(r"spice\s+(\w+)\s+dispense\s+(\d+)\s+times", cmd)
+            if m:
+                translated.append(f"Dispense {m.group(1)} spice ({m.group(2)} units).")
+            else:
+                translated.append(cmd)
+        elif cmd.startswith("ingredient_tray"):
+            m = re.match(r"ingredient_tray\s+(\d+)\s+dispense", cmd)
+            if m:
+                tray_num = int(m.group(1))
+                ings = slots_map.get(tray_num, f"Tray {tray_num} ingredients")
+                translated.append(f"Dispense Tray {tray_num} containing: {ings}.")
+            else:
+                translated.append(cmd)
+        elif cmd.startswith("set_temperature"):
+            m = re.match(r"set_temperature\s+(\d+)", cmd)
+            if m:
+                translated.append(f"Set pan temperature to {m.group(1)}°C.")
+            else:
+                translated.append(cmd)
+        elif cmd.startswith("stir"):
+            m = re.match(r"stir\s+(\w+)\s+(\d+)\s+times", cmd)
+            if m:
+                translated.append(f"Stir ({m.group(1)} mode, {m.group(2)} times).")
+            else:
+                translated.append(cmd)
+        elif cmd.startswith("wait"):
+            m = re.match(r"wait\s+(\d+)\s+seconds", cmd)
+            if m:
+                translated.append(f"Wait for {m.group(1)} seconds.")
+            else:
+                translated.append(cmd)
+        elif cmd.startswith("cook"):
+            m_sec = re.match(r"cook\s+(\d+)\s+seconds", cmd)
+            if m_sec:
+                translated.append(f"Cook for {m_sec.group(1)} seconds.")
+            else:
+                m_ai = re.match(r"cook\s+(.+?)\s+till\s+(.+)", cmd)
+                if m_ai:
+                    translated.append(f"Cook {m_ai.group(1)} till {m_ai.group(2)} (AI sensor monitored).")
+                else:
+                    translated.append(cmd)
+        else:
+            translated.append(cmd)
+
+    recipe_desc = f"Recipe: {output.recipe_name or 'Unnamed recipe'}\n"
+    recipe_desc += f"Servings: {output.serving or 'N/A'}\n"
+    recipe_desc += f"Course: {output.course or 'N/A'}\n"
+    recipe_desc += f"Consistency: {output.consistency or 'N/A'}\n\n"
+    recipe_desc += "Cooking Steps Narrated:\n"
+    for idx, step in enumerate(translated, 1):
+        recipe_desc += f"{idx}. {step}\n"
+
+    logger.info("Calling Culinary Quality Judge...")
+    
+    config_judge = types.GenerateContentConfig(
+        system_instruction=_JUDGE_SYSTEM_INSTRUCTION,
+        response_mime_type="application/json",
+        response_schema=JudgeOutput,
+        temperature=0,
+    )
+    
+    contents = [types.Content(role="user", parts=[types.Part(text=recipe_desc)])]
+    
+    try:
+        response = _generate_with_retry(
+            client, model=_MODEL, contents=contents, config=config_judge
+        )
+        if response.text:
+            judge_res = JudgeOutput.model_validate_json(response.text)
+            logger.debug(f"Judge Raw Response: {response.text}")
+            return judge_res
+        else:
+            logger.warning("Judge returned empty response. Rating defaulted to 10.")
+            return JudgeOutput(rating=10, issues=[], summary="Empty response, skipped.")
+    except Exception as e:
+        logger.warning(f"Culinary Judge call failed: {e}. Defaulting to rating 10.")
+        return JudgeOutput(rating=10, issues=[], summary=f"Failed: {e}")
 
 
 # ── Core orchestrator ──────────────────────────────────────────────────────────
@@ -1757,24 +2099,69 @@ def run_orchestrator(
     servings flow. `target_serving`, when set, forces the model to scale the
     whole recipe to exactly that many servings.
     """
-    # ── Step 1: RAG retrieval (pure code) ────────────────────────────────────
+    # ── Step 1: Dual RAG retrieval (pure code, no LLM calls) ─────────────────
+    # Source A: Qdrant — semantic similarity, timing/water reference (existing).
     rag_ref = get_rag_reference(recipe_text)
     rag_context = rag_ref["context"]
     # Log exactly what RAG retrieved so it's verifiable, not just a char count:
     # the matched dish, its per-serving cook times (used for cook-time repair),
     # and the full grounding context text passed to the model.
     logger.info(
-        f"RAG retrieved | dish_name={rag_ref.get('dish_name')!r} | "
+        f"RAG[qdrant] | dish_name={rag_ref.get('dish_name')!r} | "
         f"cook_time_by_serving={rag_ref.get('cook_time_by_serving')} | "
         f"context={len(rag_context)} chars"
     )
-    logger.info(f"RAG context text:\n{rag_context if rag_context else '(empty — no match)'}")
+    logger.info(f"RAG[qdrant] context text:\n{rag_context if rag_context else '(empty — no match)'}")
     add_span_attribute("rag.context_chars", len(rag_context))
     add_span_attribute("rag.dish_name", str(rag_ref.get("dish_name")))
     add_span_attribute("rag.cook_time_by_serving", str(rag_ref.get("cook_time_by_serving")))
 
+    # Source B: .recipe file index — ID lookup first, falling back to ingredient overlap.
+    recipe_file_matches = []
+    
+    # 1. Attempt exact Qdrant Dish ID match if available in context
+    match_id = re.search(r"Dish ID:\s*(\S+)", rag_context)
+    ref_id = match_id.group(1).strip() if match_id else None
+    if ref_id:
+        recipe_file_matches = find_by_id(ref_id, target_serving=target_serving)
+        if recipe_file_matches:
+            logger.info(f"RAG[.recipe] | matched exact Dish ID '{ref_id}' from Qdrant context")
+
+    # 2. Fall back to robust ingredient-level query if no exact ID match
+    if not recipe_file_matches:
+        raw_ing_names = _extract_raw_ingredient_names(recipe_text)
+        recipe_file_matches = find_by_ingredients(raw_ing_names) if raw_ing_names else []
+        if recipe_file_matches:
+            logger.info(
+                f"RAG[.recipe] | matched {len(recipe_file_matches)} recipe file(s) by overlap: "
+                + ", ".join(f"{rm.entry.dish_name} (Jaccard: {rm.overlap_score:.0%})"
+                            for rm in recipe_file_matches)
+            )
+
+    recipe_file_context = format_as_rag_context(recipe_file_matches)
+    if recipe_file_context:
+        add_span_attribute("rag.recipe_file_matches", len(recipe_file_matches))
+    else:
+        logger.info("RAG[.recipe] | no matches found in local index")
+        add_span_attribute("rag.recipe_file_matches", 0)
+
+    recipe_file_ref = get_reference_signals(recipe_file_matches)
+    if recipe_file_ref:
+        logger.info(
+            f"RAG[.recipe] signals | dish='{recipe_file_ref['dish_name']}' | "
+            f"cook_time={recipe_file_ref['cook_time_seconds']:.0f}s | "
+            f"spices={list(recipe_file_ref['spice_counts'].keys())}"
+        )
+        if recipe_file_matches:
+            best_match = recipe_file_matches[0].entry
+            logger.info(
+                f"RAG[.recipe] reference commands (first 30 lines):\n"
+                + "\n".join(f"  {c}" for c in best_match.commands[:30])
+            )
+
     prompt = _build_prompt(recipe_text, rag_context, is_ing_check, is_instr_check,
-                           target_serving=target_serving)
+                           target_serving=target_serving,
+                           recipe_file_context=recipe_file_context)
     client = genai.Client(api_key=_GEMINI_API_KEY)
     tools = _make_tools()
 
@@ -1864,39 +2251,25 @@ def run_orchestrator(
             f"nosh_compatible={output.nosh_compatible}, "
             f"commands={len(output.commands or [])}"
         )
+        logger.debug(f"Orchestrator draft JSON response:\n{final.text}")
         add_span_attribute("orchestrator.is_recipe", output.is_recipe)
         add_span_attribute("orchestrator.nosh_compatible", output.nosh_compatible)
 
         if not output.is_recipe or not output.nosh_compatible:
             return None, output.reason, None
 
-        # ── Step 4: Deterministic verify → repair → re-verify loop ────────────
-        # Runs ALL validators (cook time, spice-dispenser compatibility, tray
-        # weight/distribution) every round and batches every issue found into
-        # ONE repair message, rather than repairing one check at a time — fixing
-        # a spice issue can shift a tray's weight or a cook step's duration, so
-        # checking everything together avoids a fix-one-break-another ping-pong.
-        #
-        # Stopping conditions (checked in this order each round):
-        #   1. No issues found -> done, success.
-        #   2. Repair round produced unparseable output -> bail out, keep last
-        #      good output (never ship a broken JSON over a merely-imperfect one).
-        #   3. Issue count didn't strictly improve vs. the previous round -> stop
-        #      early ("stuck"); burning through remaining rounds against a
-        #      non-improving fix wastes calls for no benefit.
-        #   4. Hard cap of _MAX_REPAIR_ROUNDS reached -> stop regardless.
-        # Whatever remains unresolved is logged, not hidden — output still
-        # ships (best-effort), but the mismatch is visible in logs/telemetry
-        # rather than silently passed off as fully validated.
+        # For the repair loop, set last_model_content from the extraction.
+        contents.append(final.candidates[0].content)
         last_model_content = final.candidates[0].content
+
+        # ── Step 4: Deterministic verify → repair → re-verify loop ────────────
         prev_issue_count = None
-        # Most recent output that still had populated slots. When the model
-        # refuses mid-repair it usually empties the slots, but the serving
-        # suggestion for the retry flow needs the pre-refusal tray weights.
         last_slotted = output if output.slots else None
 
         for round_num in range(1, _MAX_REPAIR_ROUNDS + 1):
-            issues = _run_deterministic_validators(output, rag_ref, recipe_text)
+            issues = _run_deterministic_validators(
+                output, rag_ref, recipe_text, recipe_file_ref=recipe_file_ref
+            )
             add_span_attribute(f"repair.round{round_num}.issue_count", len(issues))
 
             if not issues:
@@ -1905,7 +2278,7 @@ def run_orchestrator(
             if prev_issue_count is not None and len(issues) >= prev_issue_count:
                 logger.warning(
                     f"Repair made no improvement ({prev_issue_count} -> {len(issues)} "
-                    f"issues); stopping early instead of burning remaining rounds."
+                    f"issues); stopping early."
                 )
                 break
             prev_issue_count = len(issues)
@@ -1930,6 +2303,7 @@ def run_orchestrator(
                 break
             try:
                 output = OrchestratorOutput.model_validate_json(repaired.text)
+                logger.debug(f"Repair round {round_num} JSON response:\n{repaired.text}")
                 last_model_content = repaired.candidates[0].content
                 if output.slots:
                     last_slotted = output
@@ -1939,22 +2313,15 @@ def run_orchestrator(
         else:
             logger.warning(f"Exhausted {_MAX_REPAIR_ROUNDS} repair rounds; issues may remain.")
 
-        # A repair round may legitimately flip the verdict — e.g. the model
-        # realizes mid-repair that the recipe cannot fit the trays. The
-        # pre-loop compatibility check cannot see that, so re-check here;
-        # otherwise an output self-declared incompatible (often with emptied
-        # slots and zero commands) ships to the caller as a success.
+        # A repair round may legitimately flip the verdict
         if not output.is_recipe or not output.nosh_compatible:
             logger.info(
                 f"Model declared output not shippable during repair: "
                 f"is_recipe={output.is_recipe}, nosh_compatible={output.nosh_compatible}."
             )
-            # If the refusal is size-related (the last slotted output had
-            # overweight trays), attach the retry-with-fewer-servings hint —
-            # same shape as the overweight guard below.
             src = output if output.slots else last_slotted
             if src is not None and _overweight_trays(src):
-                payload = {
+                payload = { 
                     "reason": output.reason or "Recipe could not be processed.",
                     "error_code": "too_large",
                 }
@@ -1964,21 +2331,89 @@ def run_orchestrator(
                 return None, payload, None
             return None, output.reason, None
 
-        # Deterministic last resort: if the model left a tray overweight and a tray
-        # slot is free, do the same-moment split ourselves rather than shipping a
-        # cup the user physically cannot fill. Runs after the loop so the model
-        # always gets first crack at a smarter fix (moving items between moments).
+        # Deterministic last resort split
         _auto_split_overweight_trays(output)
 
-        # Unconditional final re-check for logging/telemetry — the loop above
-        # only measures issues BEFORE each repair, so the last repair's own
-        # result is never otherwise confirmed. Don't assume; measure it.
-        final_issues = _run_deterministic_validators(output, rag_ref, recipe_text)
+        # Unconditional final re-check for logging/telemetry
+        final_issues = _run_deterministic_validators(output, rag_ref, recipe_text, recipe_file_ref=recipe_file_ref)
         add_span_attribute("repair.final_issue_count", len(final_issues))
         if final_issues:
-            logger.warning(f"Shipping output with {len(final_issues)} unresolved issue(s): {final_issues}")
+            logger.warning(f"Pre-judge output has {len(final_issues)} unresolved issue(s): {final_issues}")
         else:
-            logger.info("Final output passes all deterministic validators.")
+            logger.info("Pre-judge output passes all deterministic validators.")
+
+        # ── Step 5: Culinary Judge & Orchestrator Fix Round ──────────────────
+        judge_res = _run_culinary_judge(output, client)
+        add_span_attribute("judge.rating", judge_res.rating)
+        add_span_attribute("judge.issue_count", len(judge_res.issues))
+        
+        if judge_res.rating < 8 and judge_res.issues:
+            logger.info(f"Culinary Judge rated recipe {judge_res.rating}/10 with {len(judge_res.issues)} issues. Triggering orchestrator fix round...")
+            
+            formatted_issues = []
+            for issue in judge_res.issues:
+                formatted_issues.append(f"- [{issue.severity.upper()}] ({issue.category}): {issue.description}")
+            
+            slots_json = json.dumps([s.model_dump() for s in (output.slots or [])], indent=2)
+            judge_msg = (
+                "A culinary review found the following issues with your generated recipe:\n"
+                + "\n".join(formatted_issues) + "\n\n"
+                "You must fix these issues, but you MUST follow these strict hardware and pipeline constraints:\n"
+                "1. DO NOT change the tray/slot structure under any circumstances. The `slots` list MUST remain exactly identical to the one in your previous response. Do not add, remove, rename, or move ingredients between slots.\n"
+                "Here is the slot structure you MUST reuse exactly:\n"
+                f"{slots_json}\n\n"
+                "2. Keep the serving count, ingredient quantities, and consistency exactly identical.\n"
+                "3. To fix the cooking order, rearrange the order of commands in the `commands` list. Remember:\n"
+                "   - Nosh trays can be dispensed in ANY order (e.g., you can call 'ingredient_tray 2 dispense' first, and 'ingredient_tray 1 dispense' towards the end). You do NOT have to dispense Tray 1 first.\n"
+                "   - Spices (like cumin seeds, mustard seeds, turmeric, salt, chilli powder, coriander powder, cumin powder, garam masala) are dispensed from the Nosh spice dispenser using commands like 'spice X dispense Y times'. Do NOT put these spices in the ingredient slots/trays. Dispense them at the correct culinary moments in the `commands` list.\n"
+                "   - If the Judge says to add a whole spice (like cumin seeds) at the beginning, simply move the corresponding 'spice cumin dispense' command to the beginning of the `commands` list (after oil dispense).\n"
+                "   - If the Judge says to add an ingredient (like paneer in Tray 1) later, simply move the corresponding 'ingredient_tray 1 dispense' command to the later part of the `commands` list.\n"
+                "Keep all other parts identical unless required to fix these issues. Output the complete corrected JSON now."
+            )
+            
+            fix_contents = list(contents)
+            fix_contents.append(last_model_content)
+            fix_contents.append(types.Content(role="user", parts=[types.Part(text=judge_msg)]))
+            
+            try:
+                fixed_response = _generate_with_retry(
+                    client, model=_MODEL, contents=fix_contents, config=config_extract,
+                )
+                if fixed_response.text:
+                    fixed_output = OrchestratorOutput.model_validate_json(fixed_response.text)
+                    logger.debug(f"Judge fix round JSON response:\n{fixed_response.text}")
+                    
+                    # Programmatically enforce preservation of metadata and slot structure
+                    fixed_output.slots = output.slots
+                    fixed_output.recipe_name = output.recipe_name
+                    fixed_output.serving = output.serving
+                    fixed_output.course = output.course
+                    fixed_output.cuisine = output.cuisine
+                    fixed_output.dish_type = output.dish_type
+                    fixed_output.consistency = output.consistency
+                    fixed_output.pan_type = output.pan_type
+                    fixed_output.covered_cook_seconds = output.covered_cook_seconds
+                    fixed_output.prep_instructions = output.prep_instructions
+                    fixed_output.post_cooking_step = output.post_cooking_step
+                    
+                    pre_fix_issues = _run_deterministic_validators(output, rag_ref, recipe_text, recipe_file_ref=recipe_file_ref)
+                    post_fix_issues = _run_deterministic_validators(fixed_output, rag_ref, recipe_text, recipe_file_ref=recipe_file_ref)
+                    
+                    if len(post_fix_issues) <= len(pre_fix_issues):
+                        logger.info(f"Judge fix accepted. Issues: pre={len(pre_fix_issues)} → post={len(post_fix_issues)}")
+                        output = fixed_output
+                        last_model_content = fixed_response.candidates[0].content
+                    else:
+                        logger.warning(
+                            f"Judge fix rejected: introduced new hardware/deterministic issues "
+                            f"(pre={len(pre_fix_issues)} → post={len(post_fix_issues)}). Keeping pre-fix output."
+                        )
+                else:
+                    logger.warning("Judge fix round returned empty text. Keeping pre-fix output.")
+            except Exception as e:
+                logger.warning(f"Judge fix round failed or produced invalid output: {e}. Keeping pre-fix output.")
+        else:
+            logger.info(f"Culinary Judge rated recipe {judge_res.rating}/10. Skipping fix round.")
 
         # Deterministic guard: an overweight tray is not a quality nit — the
         # hardware cup physically cannot hold it, so the cook would fail

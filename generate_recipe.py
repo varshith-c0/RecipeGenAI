@@ -50,5 +50,5 @@ if __name__ == "__main__":
     10. Turn off the stove. Stir and serve.
     """
 
-    out = generate_recipe(example_input)
+    out = generate_recipe(example_input, True, True)
     print(out)

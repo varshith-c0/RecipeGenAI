@@ -21,3 +21,5 @@ cython_debug/
 
 **/*.bin
 *.db
+
+recipes/
